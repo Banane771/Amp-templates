@@ -1004,7 +1004,8 @@ a{color:var(--accent)}
 .th button{padding:4px 8px;opacity:.55}
 .main{flex:1;display:flex;flex-direction:column;min-width:0;height:100%}
 header{display:flex;align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
-header select{width:auto;max-width:40vw}
+header select{width:auto;max-width:40vw;min-width:0}
+header button{flex:none}
 header .title{flex:1;min-width:0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 header button{padding:6px 7px}
 .sub{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
@@ -1039,6 +1040,7 @@ details.src .tag{font-size:11px;border:1px solid var(--line);border-radius:4px;p
 .msg.user .meta{justify-content:flex-end}
 .err{color:var(--danger);font-size:13px;margin-top:4px}
 .empty{color:var(--muted);text-align:center;margin-top:16vh;padding:0 20px}
+.empty button{font-size:16px;padding:10px 18px}
 .cursor::after{content:"▍";animation:b 1s steps(2) infinite}@keyframes b{50%{opacity:0}}
 footer{border-top:1px solid var(--line);background:var(--panel);padding:8px 0 10px}
 footer .row2{display:flex;gap:6px;align-items:flex-end}
@@ -1073,7 +1075,7 @@ footer .row2{display:flex;gap:6px;align-items:flex-end}
  #menu{display:inline-block}
  .msg.user .bubble{margin-left:8%}
  header .title{display:none}
- header select{max-width:none;flex:1}
+ header select{max-width:none;flex:1 1 0;min-width:0;width:0}
 }
 </style>
 </head>
@@ -1172,7 +1174,7 @@ async function loadModels(){
  store.set('model',S.model);renderModelSelect();await loadSettings();
 }
 function renderModelSelect(){
- $('#model').innerHTML=S.models.length?S.models.map(m=>'<option'+(m===S.model?' selected':'')+'>'+esc(m)+'</option>').join(''):'<option value="">Aucun modèle — 📦 pour en télécharger</option>';
+ $('#model').innerHTML=S.models.length?S.models.map(m=>'<option'+(m===S.model?' selected':'')+'>'+esc(m)+'</option>').join(''):'<option value="">Aucun modèle</option>';
 }
 async function loadSettings(){S.settings=S.model?await api('/api/settings?model='+q(S.model)+'&persona='+q(curPersona())).catch(()=>null):null}
 async function setModel(m){
@@ -1278,7 +1280,7 @@ function renderMessages(scroll){
  const msgs=S.thread?S.thread.messages:[];
  if(!msgs.length){
   const p=S.settings&&S.settings.persona;
-  $('#list').innerHTML='<div class="empty">'+(S.model?(p?'🎭 <b>'+esc(p.name)+'</b> · ':'')+'Pose une question à <b>'+esc(S.model)+'</b>.<br>La mémoire '+(p?'de ce personnage':'de ce modèle')+' est utilisée automatiquement.':'Aucun modèle installé : ouvre 📦 pour en télécharger un.')+'</div>';return}
+  $('#list').innerHTML='<div class="empty">'+(S.model?(p?'🎭 <b>'+esc(p.name)+'</b> · ':'')+'Pose une question à <b>'+esc(S.model)+'</b>.<br>La mémoire '+(p?'de ce personnage':'de ce modèle')+' est utilisée automatiquement.':'Aucun modèle installé pour l\'instant.<br><br><button class="primary" id="getModel">📦 Télécharger un modèle</button>')+'</div>';return}
  $('#list').innerHTML=msgs.map((m,i)=>m.role==='user'?userHtml(m,i):assistantHtml(m,i,i===msgs.length-1)).join('');
  if(scroll||near)box.scrollTop=box.scrollHeight;
 }
@@ -1430,6 +1432,7 @@ $('#list').onclick=e=>{
  const c=e.target.closest('[data-copy]');
  if(c){const m=S.thread.messages[+c.dataset.copy];navigator.clipboard.writeText(m.content).then(()=>toast('Copié'),()=>toast('Copie impossible'));return}
  if(e.target.id==='regen')send(true);
+ if(e.target.id==='getModel')panelModels();
 };
 $('#box').onclick=async e=>{
  const t=e.target;
