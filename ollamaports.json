@@ -1,0 +1,16 @@
+[
+  {
+    "Protocol": "TCP",
+    "Port": 8090,
+    "Ref": "WebUIPort",
+    "Name": "Interface web",
+    "Description": "Interface de chat OllamaChat"
+  },
+  {
+    "Protocol": "TCP",
+    "Port": 11434,
+    "Ref": "APIPort",
+    "Name": "API Ollama",
+    "Description": "API Ollama (utile seulement si elle est exposée)"
+  }
+]

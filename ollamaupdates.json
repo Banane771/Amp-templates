@@ -1,0 +1,36 @@
+[
+  {
+    "UpdateStageName": "Téléchargement d'Ollama",
+    "UpdateSourcePlatform": "Linux",
+    "UpdateSource": "FetchURL",
+    "UpdateSourceData": "https://ollama.com/download/ollama-linux-amd64.tar.zst",
+    "UpdateSourceTarget": "{{$FullBaseDir}}",
+    "UnzipUpdateSource": false,
+    "SkipOnFailure": false
+  },
+  {
+    "UpdateStageName": "Extraction d'Ollama",
+    "UpdateSourcePlatform": "Linux",
+    "UpdateSource": "Executable",
+    "UpdateSourceData": "/usr/bin/tar",
+    "UpdateSourceArgs": "--zstd -xf {{$FullBaseDir}}/ollama-linux-amd64.tar.zst -C {{$FullBaseDir}}",
+    "SkipOnFailure": false
+  },
+  {
+    "UpdateStageName": "Création du dossier des modèles",
+    "UpdateSourcePlatform": "Linux",
+    "UpdateSource": "Executable",
+    "UpdateSourceData": "/usr/bin/mkdir",
+    "UpdateSourceArgs": "-p {{$FullBaseDir}}/models",
+    "SkipOnFailure": false
+  },
+  {
+    "UpdateStageName": "Téléchargement de l'interface web",
+    "UpdateSourcePlatform": "Linux",
+    "UpdateSource": "FetchURL",
+    "UpdateSourceData": "{{$WebUIScriptUrl}}",
+    "UpdateSourceTarget": "{{$FullBaseDir}}",
+    "UnzipUpdateSource": false,
+    "SkipOnFailure": false
+  }
+]
