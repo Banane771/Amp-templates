@@ -1,36 +1,39 @@
 [
-  {
-    "UpdateStageName": "Téléchargement d'Ollama",
-    "UpdateSourcePlatform": "Linux",
-    "UpdateSource": "FetchURL",
-    "UpdateSourceData": "https://ollama.com/download/ollama-linux-amd64.tar.zst",
-    "UpdateSourceTarget": "{{$FullBaseDir}}",
-    "UnzipUpdateSource": false,
-    "SkipOnFailure": false
-  },
-  {
-    "UpdateStageName": "Extraction d'Ollama",
-    "UpdateSourcePlatform": "Linux",
-    "UpdateSource": "Executable",
-    "UpdateSourceData": "/usr/bin/tar",
-    "UpdateSourceArgs": "--zstd -xf {{$FullBaseDir}}/ollama-linux-amd64.tar.zst -C {{$FullBaseDir}}",
-    "SkipOnFailure": false
-  },
-  {
-    "UpdateStageName": "Création du dossier des modèles",
-    "UpdateSourcePlatform": "Linux",
-    "UpdateSource": "Executable",
-    "UpdateSourceData": "/usr/bin/mkdir",
-    "UpdateSourceArgs": "-p {{$FullBaseDir}}/models",
-    "SkipOnFailure": false
-  },
-  {
-    "UpdateStageName": "Téléchargement de l'interface web",
-    "UpdateSourcePlatform": "Linux",
-    "UpdateSource": "FetchURL",
-    "UpdateSourceData": "{{$WebUIScriptUrl}}",
-    "UpdateSourceTarget": "{{$FullBaseDir}}",
-    "UnzipUpdateSource": false,
-    "SkipOnFailure": false
-  }
+    {
+        "UpdateStageName": "Dossiers",
+        "UpdateSourcePlatform": "Linux",
+        "UpdateSource": "CreateDirectory",
+        "UpdateSourceArgs": "{{$FullBaseDir}}models",
+        "SkipOnFailure": false
+    },
+    {
+        "UpdateStageName": "Téléchargement d'Ollama",
+        "UpdateSourcePlatform": "Linux",
+        "UpdateSourceArch": "x86_64",
+        "UpdateSource": "FetchURL",
+        "UpdateSourceData": "https://ollama.com/download/ollama-linux-amd64.tar.zst",
+        "UpdateSourceTarget": "{{$FullBaseDir}}",
+        "UpdateSourceArgs": "ollama-linux-amd64.tar.zst",
+        "OverwriteExistingFiles": true,
+        "SkipOnFailure": false
+    },
+    {
+        "UpdateStageName": "Extraction d'Ollama",
+        "UpdateSourcePlatform": "Linux",
+        "UpdateSourceArch": "x86_64",
+        "UpdateSource": "Executable",
+        "UpdateSourceData": "/bin/bash",
+        "UpdateSourceArgs": "-c \"cd \\\"{{$FullBaseDir}}\\\" && command -v zstd >/dev/null || { echo 'Erreur : zstd absent (instance hors conteneur ? installe le paquet zstd sur l hote)'; exit 1; }; rm -rf lib/ollama && tar --zstd -xf ollama-linux-amd64.tar.zst && rm -f ollama-linux-amd64.tar.zst && chmod +x bin/ollama && echo \\\"Ollama installe : $(./bin/ollama --version 2>/dev/null | tail -n1)\\\"\"",
+        "SkipOnFailure": false
+    },
+    {
+        "UpdateStageName": "Téléchargement d'OllamaChat",
+        "UpdateSourcePlatform": "Linux",
+        "UpdateSource": "FetchURL",
+        "UpdateSourceData": "{{WebUIScriptUrl}}",
+        "UpdateSourceTarget": "{{$FullBaseDir}}",
+        "UpdateSourceArgs": "ollamachat.py",
+        "OverwriteExistingFiles": true,
+        "SkipOnFailure": false
+    }
 ]
