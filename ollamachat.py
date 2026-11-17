@@ -72,7 +72,8 @@ THREADS = os.path.join(DATA, "threads")
 MEMORY = os.path.join(DATA, "memory")
 MODELS = os.path.join(DATA, "models")
 PERSONAS = os.path.join(DATA, "personas")
-for _d in (THREADS, MEMORY, MODELS, PERSONAS, os.path.join(MEMORY, "_global")):
+SCENES = os.path.join(DATA, "scenes")
+for _d in (THREADS, MEMORY, MODELS, PERSONAS, SCENES, os.path.join(MEMORY, "_global")):
     os.makedirs(_d, exist_ok=True)
 
 LOCK = threading.RLock()
@@ -525,6 +526,314 @@ def shutdown(*_):
     os._exit(0)
 
 
+# ---------------------------------------------------------------- scènes
+
+LENGTHS = {
+    "courte": (180, "Ton intervention est courte : une à trois phrases."),
+    "moyenne": (400, "Ton intervention tient en un court paragraphe."),
+    "longue": (850, "Ton intervention peut être développée : un ou deux paragraphes."),
+}
+SCENE_DEFAULTS = {"title": "", "personas": [], "prompt": "", "narrator": True, "mode": "turns",
+                  "order": "auto", "maxTurns": 16, "length": "moyenne", "think": False, "model": ""}
+NARRATOR = "Narrateur"
+
+
+def scene_path(sid):
+    return os.path.join(SCENES, sid + ".json")
+
+
+def load_scene(sid):
+    return read_json(scene_path(sid), None) if valid_id(sid) else None
+
+
+def save_scene(sc):
+    sc["updated"] = time.time()
+    write_json(scene_path(sc["id"]), sc)
+
+
+def clean_scene(b, base):
+    sc = dict(base)
+    if "title" in b:
+        sc["title"] = str(b["title"]).strip()[:120]
+    if "personas" in b and isinstance(b["personas"], list):
+        ids = []
+        for pid in b["personas"]:
+            if valid_id(str(pid)) and pid not in ids and load_persona(pid):
+                ids.append(pid)
+        sc["personas"] = ids[:8]
+    if "prompt" in b:
+        sc["prompt"] = str(b["prompt"])
+    for k in ("narrator", "think"):
+        if k in b:
+            sc[k] = bool(b[k])
+    if b.get("mode") in ("turns", "block"):
+        sc["mode"] = b["mode"]
+    if b.get("order") in ("auto", "rotation"):
+        sc["order"] = b["order"]
+    if b.get("length") in LENGTHS:
+        sc["length"] = b["length"]
+    if "maxTurns" in b:
+        try:
+            sc["maxTurns"] = max(1, min(120, int(b["maxTurns"])))
+        except (TypeError, ValueError):
+            pass
+    if "model" in b:
+        sc["model"] = str(b["model"])[:200]
+    return sc
+
+
+def scene_cast(sc):
+    return [p for p in (load_persona(pid) for pid in sc.get("personas", [])) if p]
+
+
+def spoken(turns):
+    return [t for t in turns if t.get("speaker") != "direction"]
+
+
+def list_scenes():
+    out = []
+    for f in os.listdir(SCENES):
+        if f.endswith(".json"):
+            sc = read_json(os.path.join(SCENES, f), None)
+            if sc:
+                out.append({"id": sc["id"], "title": sc.get("title") or "Scène sans titre",
+                            "cast": [p.get("name", "") for p in scene_cast(sc)],
+                            "narrator": sc.get("narrator", True), "updated": sc.get("updated", 0),
+                            "count": len(spoken(sc.get("turns", [])))})
+    out.sort(key=lambda s: s["updated"], reverse=True)
+    return out
+
+
+def scene_transcript(turns, for_director=False, limit=14000):
+    lines = []
+    for t in turns:
+        c = (t.get("content") or "").strip()
+        if not c:
+            continue
+        sp = t.get("speaker")
+        if sp == "direction":
+            if for_director:
+                lines.append("[Consigne de l'auteur : %s]" % c)
+        elif sp == "narrator":
+            lines.append("%s : %s" % (NARRATOR, c))
+        elif sp == "block":
+            lines.append(c)
+        else:
+            lines.append("%s : %s" % (t.get("name") or "?", c))
+    text = "\n\n".join(lines)
+    if len(text) > limit:
+        text = "[… début de la scène omis …]\n\n" + text[-limit:]
+    return text
+
+
+def norm(s):
+    s = (s or "").casefold().strip()
+    s = re.sub(r"[\"'«»“”*_.!?:;,()\[\]]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def match_speaker(name, cast, narrator):
+    n = norm(name)
+    if not n:
+        return None
+    if n in ("fin", "end", "termine", "terminé", "scene terminee", "scène terminée"):
+        return "END"
+    if narrator and n in ("narrateur", "narratrice", "narration", "narrator"):
+        return "narrator"
+    for p in cast:
+        if norm(p.get("name")) == n:
+            return p["id"]
+    for p in cast:
+        pn = norm(p.get("name"))
+        if pn and (pn in n or n in pn):
+            return p["id"]
+    for p in cast:
+        first = norm(p.get("name")).split(" ")[0] if norm(p.get("name")) else ""
+        if first and first in n.split(" "):
+            return p["id"]
+    return None
+
+
+def rotation_next(sc, cast, turns):
+    sp = spoken(turns)
+    remaining = sc["maxTurns"] - len(sp)
+    if sc.get("narrator") and (not sp or remaining == 1):
+        return "narrator"
+    ids = [p["id"] for p in cast]
+    last_persona = next((t["speaker"] for t in reversed(sp) if t.get("speaker") in ids), None)
+    if last_persona is None:
+        return ids[0]
+    return ids[(ids.index(last_persona) + 1) % len(ids)]
+
+
+def fallback_next(sc, cast, turns):
+    sp = spoken(turns)
+    last = sp[-1]["speaker"] if sp else None
+    counts = {p["id"]: 0 for p in cast}
+    for t in sp:
+        if t.get("speaker") in counts:
+            counts[t["speaker"]] += 1
+    choices = [p["id"] for p in cast if p["id"] != last] or [p["id"] for p in cast]
+    return min(choices, key=lambda i: counts[i])
+
+
+def gen_options(sc, settings, num_predict=None, stop=None):
+    opts = {}
+    if str(settings.get("temperature", "")).strip():
+        opts["temperature"] = float(settings["temperature"])
+    opts["num_ctx"] = int(settings["num_ctx"]) if str(settings.get("num_ctx", "")).strip() else 8192
+    if num_predict:
+        opts["num_predict"] = num_predict
+    if stop:
+        opts["stop"] = stop[:20]
+    return opts
+
+
+def ollama_call(body):
+    """Ouvre un appel /api/chat ; réessaie sans « think » si le modèle ne le gère pas."""
+    try:
+        return ollama_post("/api/chat", body)
+    except urllib.error.HTTPError as e:
+        err = http_error_text(e)
+        if "think" in body and "think" in err.lower():
+            body.pop("think")
+            return ollama_post("/api/chat", body)
+        raise RuntimeError(err)
+
+
+def director_choice(sc, cast, turns, model, settings):
+    sp = spoken(turns)
+    remaining = sc["maxTurns"] - len(sp)
+    roster = "\n".join("- %s : %s" % (p["name"], re.sub(r"\s+", " ", p.get("system", ""))[:350] or "(pas de fiche)")
+                       for p in cast)
+    if sc.get("narrator"):
+        roster += "\n- %s : décrit le décor, l'ambiance, les actions et les transitions." % NARRATOR
+    rules = [
+        "Choisis le prochain intervenant parmi la liste (nom exact).",
+        "Varie les intervenants de façon crédible et évite les monologues : un personnage ne parle deux fois de suite que si c'est vraiment naturel.",
+        "Il reste au plus %d intervention(s) avant la limite fixée par l'auteur : fais progresser la scène vers le déroulé et l'issue prévus à ce rythme." % remaining,
+        "Quand l'issue prévue est atteinte et que la scène est close, réponds FIN.",
+        "L'intention tient en une phrase : ce que cette intervention doit apporter (émotion, information, action, tension). N'écris pas la réplique elle-même.",
+    ]
+    if sc.get("narrator") and not sp:
+        rules.append("La scène n'a pas encore commencé : ouvre de préférence par le %s pour planter le décor." % NARRATOR)
+    if remaining == 1:
+        rules.append("C'est la dernière intervention autorisée : choisis celui qui peut le mieux conclure la scène selon l'issue prévue.")
+    system = ("Tu es le metteur en scène d'une scène écrite à plusieurs voix. Tu ne rédiges aucune réplique : "
+              "tu décides seulement qui intervient ensuite et ce que son intervention doit apporter.\n\n"
+              "## Scène décrite par l'auteur\n%s\n\n## Intervenants\n%s\n\n## Règles\n%s\n\n"
+              'Réponds uniquement en JSON : {"suivant": "<nom exact, %s ou FIN>", "intention": "<une phrase>"}'
+              % (sc.get("prompt", "").strip() or "(aucune description)", roster,
+                 "\n".join("- " + r for r in rules), NARRATOR if sc.get("narrator") else "personnage"))
+    tr = scene_transcript(turns, for_director=True)
+    user = "Scène jusqu'ici :\n\n%s\n\nQui intervient maintenant ?" % (tr or "(la scène n'a pas encore commencé)")
+    body = {"model": model, "stream": False, "format": "json", "think": False,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "options": dict(gen_options(sc, settings, 120), temperature=0.3)}
+    ka = keep_alive_value(settings.get("keep_alive"))
+    if ka is not None:
+        body["keep_alive"] = ka
+    try:
+        with ollama_call(body) as resp:
+            content = (json.load(resp).get("message") or {}).get("content", "")
+        try:
+            d = json.loads(content)
+        except ValueError:
+            m = re.search(r"\{.*\}", content, re.S)
+            d = json.loads(m.group(0)) if m else {}
+        who = d.get("suivant") or d.get("next") or d.get("speaker") or ""
+        return match_speaker(str(who), cast, sc.get("narrator")), str(d.get("intention") or "").strip()[:400]
+    except Exception as e:
+        print("OllamaChat : metteur en scène indisponible (%s), ordre automatique." % e, flush=True)
+        return None, ""
+
+
+def speaker_request(sc, cast, turns, speaker, intention, model, settings, direction=""):
+    sp = spoken(turns)
+    remaining = sc["maxTurns"] - len(sp)
+    num_predict, length_txt = LENGTHS.get(sc.get("length"), LENGTHS["moyenne"])
+    others = [p["name"] for p in cast if p["id"] != speaker]
+    scene_txt = sc.get("prompt", "").strip() or "(aucune description)"
+    if speaker == "narrator":
+        name = NARRATOR
+        system = ("## Scène\n%s\n\n## Personnages présents\n%s\n\n## Ton rôle\n"
+                  "Tu es le narrateur de cette scène. Écris uniquement de la narration : décor, ambiance, actions, "
+                  "déplacements, expressions et transitions. Ne fais pas parler les personnages et ne décide pas à "
+                  "leur place de ce qu'ils vont dire. %s Respecte les consignes d'écriture de la scène."
+                  % (scene_txt, ", ".join(p["name"] for p in cast) or "(aucun)", length_txt.replace("Ton intervention", "Ce passage")))
+        ask = "Écris le prochain passage de narration."
+        stop_names = [p["name"] for p in cast]
+    else:
+        p = next(x for x in cast if x["id"] == speaker)
+        name = p["name"]
+        parts = []
+        if p.get("system", "").strip():
+            parts.append("## Ta fiche de personnage\n" + p["system"].strip())
+        mem = mem_block(persona_folder(p))
+        if mem:
+            parts.append("## Ce dont tu te souviens\n" + mem)
+        parts.append("## Scène en cours\n" + scene_txt)
+        parts.append(
+            "## Ton rôle\nTu incarnes uniquement %s, aux côtés de : %s%s. Écris uniquement la prochaine intervention "
+            "de %s : ses paroles et, entre astérisques, ses gestes et attitudes. %s N'écris jamais les répliques ni les "
+            "actions des autres personnages, ne fais pas de narration générale, ne commente pas la scène et ne "
+            "commence pas par ton nom. Reste fidèle à ta fiche et aux consignes d'écriture de la scène."
+            % (name, ", ".join(others) or "personne d'autre", " et un narrateur" if sc.get("narrator") else "",
+               name, length_txt))
+        system = "\n\n".join(parts)
+        ask = "À toi, %s : écris ta prochaine intervention." % name
+        stop_names = others + ([NARRATOR] if sc.get("narrator") else [])
+    if direction:
+        system += "\n\n## Consigne de l'auteur pour la suite\n" + direction
+    if intention:
+        system += "\n\n## Indication du metteur en scène pour cette intervention\n" + intention
+    if remaining <= 1:
+        system += "\n\nCette intervention est la dernière de la scène : elle doit la conclure conformément à l'issue prévue."
+    tr = scene_transcript(turns)
+    user = ("Scène jusqu'ici :\n\n%s\n\n%s" % (tr, ask)) if tr else ("La scène commence.\n\n" + ask)
+    stop = []
+    for n in stop_names:
+        stop += ["\n%s :" % n, "\n%s:" % n, "\n**%s" % n]
+    body = {"model": model, "stream": True, "think": bool(sc.get("think")),
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "options": gen_options(sc, settings, num_predict, stop)}
+    ka = keep_alive_value(settings.get("keep_alive"))
+    if ka is not None:
+        body["keep_alive"] = ka
+    return name, body
+
+
+def block_request(sc, cast, turns, model, settings, direction=""):
+    fiches = []
+    for p in cast:
+        f = "### %s\n%s" % (p["name"], p.get("system", "").strip() or "(pas de fiche)")
+        mem = mem_block(persona_folder(p))
+        if mem:
+            f += "\nSouvenirs de %s :\n%s" % (p["name"], mem)
+        fiches.append(f)
+    num_predict, _ = LENGTHS.get(sc.get("length"), LENGTHS["moyenne"])
+    system = ("## Scène\n%s\n\n## Personnages\n%s\n\n## Consignes de rédaction\n"
+              "Rédige la scène d'un seul tenant, jusqu'à l'issue prévue, en respectant le lieu, le moment, le "
+              "contexte, le déroulé et les consignes d'écriture. Chaque personnage parle et agit conformément à sa "
+              "fiche. Écris les dialogues sous la forme « Nom : réplique », chacun sur sa propre ligne, et %s. "
+              "Vise environ %d interventions au total."
+              % (sc.get("prompt", "").strip() or "(aucune description)", "\n\n".join(fiches) or "(aucun)",
+                 "la narration en paragraphes séparés" if sc.get("narrator") else "réduis la narration au strict minimum",
+                 sc["maxTurns"]))
+    if direction:
+        system += "\n\n## Consigne de l'auteur pour la suite\n" + direction
+    tr = scene_transcript(turns)
+    user = ("Voici le début déjà écrit :\n\n%s\n\nPoursuis la scène à partir de là jusqu'à son issue." % tr) if tr \
+        else "Écris la scène."
+    body = {"model": model, "stream": True, "think": bool(sc.get("think")),
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "options": gen_options(sc, settings, min(12000, num_predict * sc["maxTurns"] + 300))}
+    ka = keep_alive_value(settings.get("keep_alive"))
+    if ka is not None:
+        body["keep_alive"] = ka
+    return body
+
+
 # ---------------------------------------------------------------- serveur web
 
 class Handler(BaseHTTPRequestHandler):
@@ -630,6 +939,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.memory(method, q)
             elif path == "/api/personas":
                 self.personas(method, q)
+            elif path == "/api/scenes" and method == "GET":
+                self.send_json(list_scenes())
+            elif path == "/api/scenes" and method == "POST":
+                now = time.time()
+                sc = clean_scene(self.body(), SCENE_DEFAULTS)
+                sc.update({"id": uuid.uuid4().hex, "created": now, "turns": []})
+                with LOCK:
+                    save_scene(sc)
+                self.send_json(sc)
+            elif re.fullmatch(r"/api/scenes/[a-f0-9]{32}(/run|/stop)?", path):
+                parts = path.split("/")
+                self.scene_item(method, parts[3], parts[4] if len(parts) > 4 else "")
             else:
                 self.send_json({"error": "Introuvable"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -947,6 +1268,178 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "Méthode non prise en charge"}, 405)
 
 
+    # -- scènes
+    def scene_item(self, method, sid, action):
+        if action == "stop":
+            STOPS.add(sid)
+            return self.send_json({"ok": True})
+        if action == "run":
+            return self.scene_run(sid, self.body())
+        with LOCK:
+            sc = load_scene(sid)
+            if not sc:
+                return self.send_json({"error": "Scène introuvable"}, 404)
+            if method == "GET":
+                return self.send_json(sc)
+            if method == "PUT":
+                b = self.body()
+                turns = sc.get("turns", [])
+                sc = clean_scene(b, sc)
+                if "truncate" in b:
+                    try:
+                        sc["turns"] = turns[:max(0, int(b["truncate"]))]
+                    except (TypeError, ValueError):
+                        pass
+                save_scene(sc)
+                return self.send_json(sc)
+            if method == "DELETE":
+                os.remove(scene_path(sid))
+                return self.send_json({"ok": True})
+        self.send_json({"error": "Méthode non prise en charge"}, 405)
+
+    def scene_run(self, sid, b):
+        with LOCK:
+            sc = load_scene(sid)
+            if not sc:
+                return self.send_json({"error": "Scène introuvable"}, 404)
+            cast = scene_cast(sc)
+            if not cast:
+                return self.send_json({"error": "Ajoute au moins un personnage à la scène"}, 400)
+            model = str(b.get("model") or sc.get("model") or "")
+            if not model:
+                return self.send_json({"error": "Aucun modèle choisi"}, 400)
+            sc["model"] = model
+            direction = str(b.get("direction") or "").strip()[:2000]
+            if direction:
+                sc.setdefault("turns", []).append({"speaker": "direction", "content": direction, "ts": time.time()})
+            save_scene(sc)
+        try:
+            steps = max(1, int(b["steps"])) if b.get("steps") else None
+        except (TypeError, ValueError):
+            steps = None
+        settings = get_settings(model)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        state = {"client": True}
+
+        def send(obj):
+            if not state["client"]:
+                return
+            try:
+                self.wfile.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            except OSError:
+                state["client"] = False  # la scène continue et s'enregistre quand même
+
+        def stream(body, strip_name=None):
+            """Diffuse une génération ; renvoie (texte, interrompu)."""
+            acc, buf, flushed = [], "", strip_name is None
+            pat = re.compile(r"^\s*\**\s*%s\s*\**\s*[:：]\s*(?:\*\*\s+)?" % re.escape(strip_name), re.I) if strip_name else None
+            resp = ollama_call(body)
+            try:
+                for line in resp:
+                    if sid in STOPS:
+                        return "".join(acc), True
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    if d.get("error"):
+                        raise RuntimeError(d["error"])
+                    c = (d.get("message") or {}).get("content") or ""
+                    if (d.get("message") or {}).get("thinking") and not acc and not buf:
+                        send({"status": "Réflexion…"})
+                    if c:
+                        if not flushed:
+                            buf += c
+                            if len(buf) < len(strip_name) + 8 and "\n" not in buf.strip():
+                                continue
+                            c, buf, flushed = pat.sub("", buf, count=1), "", True
+                            if not c:
+                                continue
+                        acc.append(c)
+                        send({"c": c})
+            finally:
+                resp.close()
+            if buf:
+                c = pat.sub("", buf, count=1)
+                acc.append(c)
+                send({"c": c})
+            return "".join(acc), False
+
+        def add_turn(turn):
+            with LOCK:
+                cur = load_scene(sid) or sc
+                cur.setdefault("turns", []).append(turn)
+                save_scene(cur)
+                sc["turns"] = cur["turns"]
+
+        reason, done_now = "limite", 0
+        STOPS.discard(sid)
+        try:
+            if sc.get("mode") == "block":
+                send({"turn": {"speaker": "block", "name": "Scène"}})
+                text, stopped = stream(block_request(sc, cast, sc.get("turns", []), model, settings, direction))
+                if text.strip():
+                    add_turn({"speaker": "block", "name": "Scène", "content": text.strip(), "ts": time.time(),
+                              "model": model, "stopped": stopped})
+                send({"end_turn": True})
+                reason = "stop" if stopped else "fin"
+            else:
+                while True:
+                    turns = sc.get("turns", [])
+                    if len(spoken(turns)) >= sc["maxTurns"]:
+                        reason = "limite"
+                        break
+                    if steps and done_now >= steps:
+                        reason = "pas"
+                        break
+                    if sid in STOPS:
+                        reason = "stop"
+                        break
+                    intention, who = "", None
+                    if sc.get("order") == "rotation":
+                        who = rotation_next(sc, cast, turns)
+                    else:
+                        send({"status": "Le metteur en scène choisit qui intervient…"})
+                        who, intention = director_choice(sc, cast, turns, model, settings)
+                        if sid in STOPS:
+                            reason = "stop"
+                            break
+                        if who == "END":
+                            if spoken(turns):
+                                reason = "fin"
+                                break
+                            who = None
+                        sp = spoken(turns)
+                        if who and len(sp) >= 2 and sp[-1]["speaker"] == sp[-2]["speaker"] == who:
+                            who = None  # pas trois fois de suite
+                        if who is None:
+                            who = "narrator" if (sc.get("narrator") and not sp) else fallback_next(sc, cast, turns)
+                    name, body = speaker_request(sc, cast, turns, who, intention, model, settings, direction)
+                    send({"turn": {"speaker": who, "name": name, "intention": intention}})
+                    text, stopped = stream(body, strip_name=name)
+                    if text.strip():
+                        add_turn({"speaker": who, "name": name, "content": text.strip(), "ts": time.time(),
+                                  "model": model, "intention": intention, "stopped": stopped})
+                    send({"end_turn": True})
+                    done_now += 1
+                    if stopped:
+                        reason = "stop"
+                        break
+        except (RuntimeError, urllib.error.URLError, urllib.error.HTTPError) as e:
+            msg = getattr(e, "reason", None) or str(e)
+            send({"error": "Ollama : %s" % msg})
+            reason = "erreur"
+        finally:
+            STOPS.discard(sid)
+        send({"done": True, "reason": reason, "count": len(spoken(sc.get("turns", []))), "max": sc["maxTurns"]})
+
+
 # ---------------------------------------------------------------- écran d'accueil
 
 ICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#2f6f5e"/><path d="M136 150h240a40 40 0 0 1 40 40v120a40 40 0 0 1-40 40H250l-74 58v-58h-40a40 40 0 0 1-40-40V190a40 40 0 0 1 40-40z" fill="#f6f5f2"/><circle cx="196" cy="250" r="22" fill="#2f6f5e"/><circle cx="256" cy="250" r="22" fill="#2f6f5e"/><circle cx="316" cy="250" r="22" fill="#2f6f5e"/></svg>"""
@@ -973,8 +1466,8 @@ PAGE = r"""<!doctype html>
 <link rel="apple-touch-icon" href="/icon.svg">
 <title>OllamaChat</title>
 <style>
-:root{--bg:#f6f5f2;--panel:#fff;--side:#efede8;--text:#1d1c1a;--muted:#6f6b64;--line:#dcd8d0;--accent:#2f6f5e;--accent-text:#fff;--user:#e4efe9;--code:#f0eee9;--danger:#a33a2c}
-@media (prefers-color-scheme:dark){:root{--bg:#161615;--panel:#1f1e1c;--side:#1b1a19;--text:#ecebe8;--muted:#9a968e;--line:#33312d;--accent:#5fb39c;--accent-text:#0d1512;--user:#24332d;--code:#2a2926;--danger:#e0705f}}
+:root{--c0:#2f6f5e;--c1:#9a4a1c;--c2:#3a5a9b;--c3:#8a3a7a;--c4:#6b6b1f;--c5:#a33a2c;--bg:#f6f5f2;--panel:#fff;--side:#efede8;--text:#1d1c1a;--muted:#6f6b64;--line:#dcd8d0;--accent:#2f6f5e;--accent-text:#fff;--user:#e4efe9;--code:#f0eee9;--danger:#a33a2c}
+@media (prefers-color-scheme:dark){:root{--c0:#5fb39c;--c1:#e0925f;--c2:#7fa4e6;--c3:#d48ac4;--c4:#c2c25a;--c5:#e0705f;--bg:#161615;--panel:#1f1e1c;--side:#1b1a19;--text:#ecebe8;--muted:#9a968e;--line:#33312d;--accent:#5fb39c;--accent-text:#0d1512;--user:#24332d;--code:#2a2926;--danger:#e0705f}}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;overflow:hidden}
@@ -1068,6 +1561,29 @@ footer .row2{display:flex;gap:6px;align-items:flex-end}
 .note{font-size:13px;color:var(--muted)}
 #toast{position:fixed;bottom:96px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:14px;display:none;z-index:30;max-width:90vw}
 #veil{display:none}
+[hidden]{display:none!important}
+.side-tabs{display:flex;gap:6px}.side-tabs button{flex:1;padding:6px 4px;font-size:14px}
+.side-tabs button.on{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
+.cast{font-size:13px;color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cast b{font-weight:600}
+.turn{margin:0 0 16px}
+.turn .who{font-weight:650;font-size:13px;letter-spacing:.3px;margin-bottom:2px;display:flex;gap:6px;align-items:center}
+.turn .who small{font-weight:400;color:var(--muted)}
+.turn .who button{padding:0 6px;font-size:12px;opacity:.5;color:var(--muted)}
+.turn .who button:hover{opacity:1}
+.turn.narr .bubble{font-style:italic}
+.turn.narr .who{color:var(--muted)}
+.turn.dir{font-size:13px;color:var(--muted);border-left:3px solid var(--line);padding:2px 0 2px 10px;display:flex;gap:6px;align-items:flex-start}
+.turn.dir span{flex:1}
+.turn.dir button{padding:0 6px;font-size:12px;opacity:.5}
+.turn .intent{font-size:12px;color:var(--muted);margin-bottom:2px}
+#sceneStatus{font-size:13px;color:var(--muted);margin-bottom:6px;min-height:0}
+#sceneStatus:empty{display:none}
+.castlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px}
+.castlist label{border:1px solid var(--line);border-radius:8px;padding:6px 8px;display:flex;gap:8px;align-items:center;cursor:pointer}
+.castlist input{width:auto}
+#dirInput{resize:none;max-height:30vh;min-height:42px}
+#sceneFoot button{white-space:nowrap;flex:none}
 @media (max-width:760px){
  .side{position:fixed;left:0;top:0;bottom:0;z-index:15;transform:translateX(-100%);transition:transform .2s}
  .side.open{transform:none}
@@ -1083,9 +1599,12 @@ footer .row2{display:flex;gap:6px;align-items:flex-end}
 <aside class="side" id="side">
  <div class="top">
   <div class="brand">OllamaChat</div>
+  <div class="side-tabs"><button id="tabChat" class="on">💬 Fils</button><button id="tabScene">🎬 Scènes</button></div>
   <button class="primary" id="newBtn">+ Nouveau fil</button>
-  <input id="search" type="search" placeholder="Rechercher dans les fils…">
-  <label><input type="checkbox" id="filter"> Seulement les fils de ce modèle</label>
+  <div id="chatTools" style="display:flex;flex-direction:column;gap:8px">
+   <input id="search" type="search" placeholder="Rechercher dans les fils…">
+   <label><input type="checkbox" id="filter"> Seulement les fils de ce modèle</label>
+  </div>
  </div>
  <div class="threads" id="threads"></div>
 </aside>
@@ -1100,20 +1619,33 @@ footer .row2{display:flex;gap:6px;align-items:flex-end}
   <button class="ghost" id="setBtn" title="Réglages du modèle">⚙</button>
   <button class="ghost" id="modBtn" title="Modèles">📦</button>
  </header>
- <div class="sub">
+ <div class="sub" id="chatSub">
   <select id="persona" title="Personnage"></select>
   <button class="chip" id="webBtn" title="Autoriser la recherche sur internet" hidden>🌐 Web</button>
   <span class="grow"></span>
   <button class="ghost" id="memoBtn" title="Extraire les faits durables de ce fil vers la mémoire">Mémoriser</button>
  </div>
+ <div class="sub" id="sceneSub" hidden>
+  <div class="cast grow" id="castLine"></div>
+  <button class="ghost" id="sceneEdit">Modifier</button>
+  <button class="ghost" id="sceneCopy">Copier</button>
+ </div>
  <div class="msgs" id="msgs"><div class="wrap" id="list"></div></div>
- <footer><div class="wrap">
+ <footer id="chatFoot"><div class="wrap">
   <div class="chips" id="chips"></div>
   <div class="row2">
    <button class="ghost" id="attBtn" title="Joindre une image ou un fichier texte">📎</button>
    <input type="file" id="file" multiple hidden accept="image/*,.txt,.md,.rpy,.py,.json,.csv,.log,.xml,.html,.js,.css,.yml,.yaml,.ini,.cfg,.toml,.lua,.cs,.cpp,.h">
    <textarea id="input" rows="1" placeholder="Écris ton message…"></textarea>
    <button class="primary" id="sendBtn">Envoyer</button>
+  </div>
+ </div></footer>
+ <footer id="sceneFoot" hidden><div class="wrap">
+  <div id="sceneStatus"></div>
+  <div class="row2">
+   <textarea id="dirInput" rows="1" placeholder="Consigne pour la suite (facultatif)…"></textarea>
+   <button id="stepBtn" title="Jouer une seule intervention">+1</button>
+   <button class="primary" id="playBtn">▶ Jouer</button>
   </div>
  </div></footer>
 </div>
@@ -1124,7 +1656,8 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const store={get(k,d){try{const v=localStorage.getItem(k);return v===null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
 const S={models:[],model:store.get('model',''),threads:[],thread:null,settings:null,busy:false,filter:store.get('filter',false),
- personas:[],persona:store.get('persona',''),web:store.get('web',false),config:{web:false},attach:[],search:''};
+ personas:[],persona:store.get('persona',''),web:store.get('web',false),config:{web:false},attach:[],search:'',
+ mode:store.get('mode','chat'),scenes:[],scene:null,live:null,status:''};
 const coarse=matchMedia('(pointer:coarse)').matches;
 const FILE_SEP='\n\n📎 Fichier joint : ';
 
@@ -1207,6 +1740,7 @@ function threadRow(t){
 }
 let searchRes=null;
 function renderThreads(){
+ if(S.mode==='scene')return renderScenes();
  const list=searchRes!==null?searchRes:S.threads.filter(t=>!S.filter||t.model===S.model);
  $('#threads').innerHTML=list.length?list.map(threadRow).join(''):'<div class="note" style="padding:10px">'+(searchRes!==null?'Aucun résultat.':'Aucun fil pour l\'instant.')+'</div>';
  $('#title').textContent=S.thread?(S.thread.title||'Nouveau fil'):'';
@@ -1276,6 +1810,7 @@ function assistantHtml(m,i,isLast){
  return h+'</div>';
 }
 function renderMessages(scroll){
+ if(S.mode==='scene')return renderScene(scroll);
  const box=$('#msgs'),near=box.scrollHeight-box.scrollTop-box.clientHeight<120;
  const msgs=S.thread?S.thread.messages:[];
  if(!msgs.length){
@@ -1403,20 +1938,151 @@ async function panelMemory(){
  $('#box').dataset.folder=folder;
 }
 
+/* ---------- scènes ---------- */
+const PROMPT_TEMPLATE="Lieu : \nMoment : \nContexte : \nDéroulé et issue : \nConsignes d'écriture : ";
+const spokenTurns=sc=>(sc&&sc.turns||[]).filter(t=>t.speaker!=='direction');
+function setMode(m){
+ S.mode=m;store.set('mode',m);const sc=m==='scene';
+ $('#tabChat').classList.toggle('on',!sc);$('#tabScene').classList.toggle('on',sc);
+ $('#newBtn').textContent=sc?'+ Nouvelle scène':'+ Nouveau fil';
+ $('#chatTools').hidden=sc;$('#chatSub').hidden=sc;$('#chatFoot').hidden=sc;$('#sceneSub').hidden=!sc;$('#sceneFoot').hidden=!sc;
+ $('#renameBtn').title=sc?'Modifier la scène':'Renommer le fil';
+ renderThreads();renderMessages(true);
+}
+async function loadScenes(){S.scenes=await api('/api/scenes').catch(()=>[]);if(S.mode==='scene')renderScenes()}
+function renderScenes(){
+ $('#threads').innerHTML=S.scenes.length?S.scenes.map(s=>'<div class="th'+(S.scene&&S.scene.id===s.id?' active':'')+'" data-sid="'+s.id+'"><div class="t"><div>🎬 '+esc(s.title)+'</div><small>'+esc(s.cast.join(', ')||'aucun personnage')+' · '+s.count+' interv. · '+new Date(s.updated*1000).toLocaleDateString('fr-FR')+'</small></div><button class="ghost" data-delscene="'+s.id+'" title="Supprimer">✕</button></div>').join(''):'<div class="note" style="padding:10px">Aucune scène pour l\'instant.</div>';
+ $('#title').textContent=S.scene?(S.scene.title||'Scène sans titre'):'';
+}
+function colorOf(t){if(t.speaker==='narrator'||t.speaker==='block')return 'var(--muted)';const i=(S.scene.personas||[]).indexOf(t.speaker);return 'var(--c'+((i<0?0:i)%6)+')'}
+function turnHtml(t,i,isLastSpoken,live){
+ if(t.speaker==='direction')return '<div class="turn dir"><span>📝 Consigne : '+esc(t.content)+'</span>'+(live?'':'<button class="ghost" data-cut="'+i+'" title="Supprimer cette consigne et la suite">✕</button>')+'</div>';
+ const narr=t.speaker==='narrator'||t.speaker==='block';
+ let h='<div class="turn'+(narr?' narr':'')+'"><div class="who" style="color:'+colorOf(t)+'">'+esc(t.name||'?')+(t.stopped?' <small>· interrompu</small>':'');
+ if(!live&&!S.busy){if(isLastSpoken)h+='<button class="ghost" data-regen="'+i+'" title="Réécrire cette intervention">↻</button>';h+='<button class="ghost" data-cut="'+i+'" title="Supprimer cette intervention et la suite">✕</button>'}
+ return h+'</div><div class="bubble'+(live?' cursor':'')+'">'+md(t.content)+'</div></div>';
+}
+function renderScene(scroll){
+ const box=$('#msgs'),near=box.scrollHeight-box.scrollTop-box.clientHeight<120,sc=S.scene;
+ updateSceneBar();
+ if(!sc){$('#list').innerHTML='<div class="empty">🎬 Choisis une scène dans la liste, ou crée la première.<br><br><button class="primary" id="newSceneBig">+ Nouvelle scène</button></div>';return}
+ const turns=sc.turns||[];
+ if(!turns.length&&!S.live){$('#list').innerHTML='<div class="empty">La scène est prête.<br>Ajoute si besoin une consigne en bas, puis lance-la avec <b>▶ Jouer</b>.<br><br><small>'+esc((sc.prompt||'').slice(0,400))+'</small></div>';return}
+ let lastSpoken=-1;turns.forEach((t,i)=>{if(t.speaker!=='direction')lastSpoken=i});
+ $('#list').innerHTML=turns.map((t,i)=>turnHtml(t,i,i===lastSpoken,false)).join('')+(S.live?turnHtml(S.live,-1,false,true):'');
+ if(scroll||near)box.scrollTop=box.scrollHeight;
+}
+function updateSceneBar(){
+ const sc=S.scene,b=$('#playBtn'),st=$('#stepBtn');
+ $('#sceneStatus').textContent=S.status||'';
+ if(!sc){$('#castLine').textContent='';b.disabled=st.disabled=true;$('#sceneEdit').disabled=$('#sceneCopy').disabled=true;return}
+ $('#sceneEdit').disabled=$('#sceneCopy').disabled=false;
+ const names=(sc.personas||[]).map(id=>(S.personas.find(p=>p.id===id)||{}).name).filter(Boolean);
+ const n=spokenTurns(sc).length,block=sc.mode==='block';
+ $('#castLine').innerHTML='🎭 <b>'+esc(names.join(', ')||'aucun personnage')+'</b>'+(sc.narrator?' · Narrateur':'')+' · '+(block?'d\'un seul bloc':n+'/'+sc.maxTurns+' interv.');
+ st.hidden=block;b.disabled=false;
+ if(S.busy){b.textContent='■ Stop';b.classList.remove('primary');b.classList.add('danger');st.disabled=true}
+ else{b.classList.add('primary');b.classList.remove('danger');st.disabled=n>=sc.maxTurns;
+  b.textContent=block?(n?'▶ Poursuivre':'▶ Écrire la scène'):(n>=sc.maxTurns?'▶ Prolonger (+4)':n?'▶ Continuer':'▶ Jouer')}
+}
+async function openScene(id){
+ try{S.scene=await api('/api/scenes/'+id)}catch(e){toast(e.message);return}
+ store.set('scene',id);renderScenes();renderScene(true);closeSide();
+}
+async function delScene(id){
+ if(!confirm('Supprimer cette scène ?'))return;
+ await api('/api/scenes/'+id,{method:'DELETE'}).catch(()=>{});
+ if(S.scene&&S.scene.id===id){S.scene=null;store.set('scene','')}
+ await loadScenes();renderScene(true);
+}
+function panelScene(sc){
+ const e=sc||{title:'',personas:[],prompt:PROMPT_TEMPLATE,narrator:true,mode:'turns',order:'auto',maxTurns:16,length:'moyenne',think:false};
+ const opt=(v,cur,label)=>'<option value="'+v+'"'+(v===cur?' selected':'')+'>'+label+'</option>';
+ openModal(head(sc?'Modifier la scène':'Nouvelle scène')
+ +'<div class="field"><span>Titre</span><input id="eTitle" value="'+esc(e.title)+'" placeholder="ex. La forge d\'Aldric, de nuit"></div>'
+ +'<div class="field"><span>Personnages présents</span>'+(S.personas.length?'<div class="castlist">'+S.personas.map(p=>'<label><input type="checkbox" data-castp="'+p.id+'"'+(e.personas.includes(p.id)?' checked':'')+'> 🎭 '+esc(p.name)+'</label>').join('')+'</div>':'<div class="note">Aucun personnage pour l\'instant. <button id="goPersonas">Créer des personnages</button></div>')+'</div>'
+ +'<div class="field check"><input type="checkbox" id="eNarr"'+(e.narrator?' checked':'')+'><label for="eNarr">Ajouter un narrateur (décor, ambiance, actions, transitions)</label></div>'
+ +'<div class="field"><span>Prompt de la scène : lieu, moment, contexte, déroulé et issue, consignes d\'écriture. Il est donné à chaque personnage, en plus de sa propre fiche.</span><textarea id="ePrompt" rows="10">'+esc(e.prompt)+'</textarea></div>'
+ +'<div class="row"><div class="field"><span>Écriture</span><select id="eMode">'+opt('turns',e.mode,'Tour par tour')+opt('block',e.mode,'D\'un seul bloc (plus rapide)')+'</select></div>'
+ +'<div class="field"><span>Ordre de parole</span><select id="eOrder">'+opt('auto',e.order,'Choisi par un metteur en scène')+opt('rotation',e.order,'Chacun son tour (plus rapide)')+'</select></div></div>'
+ +'<div class="row"><div class="field"><span>Interventions maximum</span><input id="eMax" type="number" min="1" max="120" inputmode="numeric" value="'+e.maxTurns+'"></div>'
+ +'<div class="field"><span>Longueur des interventions</span><select id="eLen">'+opt('courte',e.length,'Courte')+opt('moyenne',e.length,'Moyenne')+opt('longue',e.length,'Longue')+'</select></div></div>'
+ +'<div class="field check"><input type="checkbox" id="eThink"'+(e.think?' checked':'')+'><label for="eThink">Laisser le modèle réfléchir avant chaque intervention (meilleur, mais bien plus lent en CPU)</label></div>'
+ +'<div class="note">Le modèle utilisé est celui sélectionné en haut au moment de jouer.</div>'
+ +'<div class="row" style="margin-top:12px">'+(sc?'<button class="danger" id="eDel">Supprimer</button>':'')+'<span></span><button class="primary" id="eSave">Enregistrer</button></div>','scene');
+ $('#box').dataset.sid=sc?sc.id:'';
+}
+async function saveScene(){
+ const sid=$('#box').dataset.sid;
+ const body={title:$('#eTitle').value.trim(),personas:[...document.querySelectorAll('[data-castp]')].filter(x=>x.checked).map(x=>x.dataset.castp),
+  narrator:$('#eNarr').checked,prompt:$('#ePrompt').value,mode:$('#eMode').value,order:$('#eOrder').value,maxTurns:+$('#eMax').value||16,length:$('#eLen').value,think:$('#eThink').checked};
+ if(!body.personas.length){toast('Choisis au moins un personnage');return}
+ try{S.scene=await api(sid?'/api/scenes/'+sid:'/api/scenes',{method:sid?'PUT':'POST',body});store.set('scene',S.scene.id);closeModal();await loadScenes();renderScene(true);toast('Scène enregistrée')}
+ catch(x){toast(x.message,5000)}
+}
+async function runScene(opts={}){
+ const sc=S.scene;if(!sc||S.busy)return;
+ if(!S.model){toast('Choisis ou télécharge un modèle');return}
+ if(sc.mode!=='block'&&!opts.steps&&spokenTurns(sc).length>=sc.maxTurns){
+  try{S.scene=await api('/api/scenes/'+sc.id,{method:'PUT',body:{maxTurns:sc.maxTurns+4}})}catch(e){toast(e.message);return}
+ }
+ const direction=$('#dirInput').value.trim();$('#dirInput').value='';autosizeDir();
+ if(direction)S.scene.turns.push({speaker:'direction',content:direction});
+ S.busy=true;S.status='Préparation…';renderScene(true);
+ let err='',reason='';
+ try{
+  const r=await fetch('/api/scenes/'+sc.id+'/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:S.model,direction,steps:opts.steps||0})});
+  if(!r.ok){let e;try{e=(await r.json()).error}catch(x){e=r.statusText}throw new Error(e)}
+  await readNdjson(r,d=>{
+   if(d.status)S.status=d.status;
+   if(d.turn){S.live={speaker:d.turn.speaker,name:d.turn.name,content:''};S.status='✍️ '+d.turn.name+' écrit…'}
+   if(d.c&&S.live)S.live.content+=d.c;
+   if(d.end_turn){if(S.live&&S.live.content.trim())S.scene.turns.push(Object.assign({},S.live,{content:S.live.content.trim()}));S.live=null}
+   if(d.error)err=d.error;if(d.done)reason=d.reason;
+   schedule()});
+ }catch(e){err=e.message}
+ S.busy=false;S.live=null;S.status='';
+ try{S.scene=await api('/api/scenes/'+sc.id)}catch(e){}
+ renderScene();loadScenes();
+ if(err)toast(err,6000);
+ else if(reason==='fin')toast('🎬 Scène terminée',3500);
+ else if(reason==='limite')toast('Limite de '+S.scene.maxTurns+' interventions atteinte',3500);
+ else if(reason==='stop')toast('Scène interrompue');
+}
+async function stopScene(){if(S.scene)await api('/api/scenes/'+S.scene.id+'/stop',{method:'POST',body:{}}).catch(()=>{})}
+async function cutScene(i,regen){
+ if(!regen&&!confirm('Supprimer cette intervention et toute la suite ?'))return;
+ try{S.scene=await api('/api/scenes/'+S.scene.id,{method:'PUT',body:{truncate:i}})}catch(e){toast(e.message);return}
+ renderScene();loadScenes();
+ if(regen)runScene({steps:1});
+}
+function sceneText(sc){
+ return spokenTurns(sc).map(t=>t.speaker==='narrator'||t.speaker==='block'?t.content:t.name+' : '+t.content).join('\n\n');
+}
+function autosizeDir(){const t=$('#dirInput');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,innerHeight*.3)+'px'}
+
 /* ---------- interface ---------- */
 function autosize(){const t=$('#input');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,innerHeight*.4)+'px'}
 function closeSide(){$('#side').classList.remove('open');$('#veil').classList.remove('open')}
 $('#menu').onclick=()=>{$('#side').classList.add('open');$('#veil').classList.add('open')};
 $('#veil').onclick=closeSide;
-$('#newBtn').onclick=()=>newThread(false);
+$('#newBtn').onclick=()=>S.mode==='scene'?panelScene(null):newThread(false);
+$('#tabChat').onclick=()=>setMode('chat');
+$('#tabScene').onclick=()=>setMode('scene');
+$('#sceneEdit').onclick=()=>S.scene&&panelScene(S.scene);
+$('#sceneCopy').onclick=()=>{if(!S.scene)return;const t=sceneText(S.scene);if(!t){toast('La scène est vide');return}navigator.clipboard.writeText(t).then(()=>toast('Scène copiée'),()=>toast('Copie impossible'))};
+$('#playBtn').onclick=()=>S.busy?stopScene():runScene({});
+$('#stepBtn').onclick=()=>runScene({steps:1});
+$('#dirInput').addEventListener('input',autosizeDir);
+$('#dirInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!coarse){e.preventDefault();if(!S.busy)runScene({})}});
 $('#search').addEventListener('input',onSearch);
 $('#filter').checked=S.filter;$('#filter').onchange=e=>{S.filter=e.target.checked;store.set('filter',S.filter);renderThreads()};
 $('#model').onchange=e=>setModel(e.target.value);
 $('#persona').onchange=e=>setPersona(e.target.value);
 $('#webBtn').onclick=()=>{S.web=!S.web;store.set('web',S.web);renderWeb();toast(S.web?'Recherche web autorisée pour les prochains messages':'Recherche web désactivée')};
 $('#memoBtn').onclick=()=>memorize(false);
-$('#threads').onclick=e=>{const del=e.target.closest('[data-del]');if(del){e.stopPropagation();delThread(del.dataset.del);return}const th=e.target.closest('.th');if(th)openThread(th.dataset.id)};
-$('#renameBtn').onclick=async()=>{if(!S.thread)return;const t=prompt('Nom du fil',S.thread.title||'');if(t===null)return;S.thread=await api('/api/threads/'+S.thread.id,{method:'PUT',body:{title:t.trim()}});loadThreads()};
+$('#threads').onclick=e=>{const ds=e.target.closest('[data-delscene]');if(ds){e.stopPropagation();delScene(ds.dataset.delscene);return}const sr=e.target.closest('[data-sid]');if(sr){openScene(sr.dataset.sid);return}const del=e.target.closest('[data-del]');if(del){e.stopPropagation();delThread(del.dataset.del);return}const th=e.target.closest('.th');if(th)openThread(th.dataset.id)};
+$('#renameBtn').onclick=async()=>{if(S.mode==='scene'){if(S.scene)panelScene(S.scene);return}if(!S.thread)return;const t=prompt('Nom du fil',S.thread.title||'');if(t===null)return;S.thread=await api('/api/threads/'+S.thread.id,{method:'PUT',body:{title:t.trim()}});loadThreads()};
 $('#sendBtn').onclick=()=>S.busy?stop():send(false);
 $('#attBtn').onclick=()=>$('#file').click();
 $('#file').onchange=e=>{addFiles([...e.target.files]);e.target.value=''};
@@ -1433,11 +2099,17 @@ $('#list').onclick=e=>{
  if(c){const m=S.thread.messages[+c.dataset.copy];navigator.clipboard.writeText(m.content).then(()=>toast('Copié'),()=>toast('Copie impossible'));return}
  if(e.target.id==='regen')send(true);
  if(e.target.id==='getModel')panelModels();
+ if(e.target.id==='newSceneBig')panelScene(null);
+ const cut=e.target.closest('[data-cut]');if(cut){cutScene(+cut.dataset.cut,false);return}
+ const rg=e.target.closest('[data-regen]');if(rg){cutScene(+rg.dataset.regen,true);return}
 };
 $('#box').onclick=async e=>{
  const t=e.target;
  if(t.closest('[data-close]')){editP=null;return closeModal()}
  if(t.id==='sSave')return saveSettings();
+ if(t.id==='eSave')return saveScene();
+ if(t.id==='eDel'){const id=$('#box').dataset.sid;closeModal();return delScene(id)}
+ if(t.id==='goPersonas')return panelPersonas();
  if(t.id==='pullBtn'){const n=$('#pullName').value.trim();if(n)pull(n);return}
  if(t.dataset.unload){await api('/api/ollama/generate',{method:'POST',body:{model:t.dataset.unload,keep_alive:0}}).catch(x=>toast(x.message));return panelModels()}
  if(t.dataset.delmodel){if(!confirm('Supprimer '+t.dataset.delmodel+' du disque ?'))return;await api('/api/ollama/delete',{method:'DELETE',body:{model:t.dataset.delmodel,name:t.dataset.delmodel}}).catch(x=>toast(x.message));await loadModels();return panelModels()}
@@ -1461,6 +2133,10 @@ $('#box').onclick=async e=>{
  await loadPersonas();await loadModels();await loadThreads();
  const last=store.get('thread','');
  if(last&&S.threads.some(t=>t.id===last))await openThread(last);else{renderPersonaSelect();renderMessages(true)}
+ await loadScenes();
+ const ls=store.get('scene','');
+ if(ls&&S.scenes.some(s=>s.id===ls)){try{S.scene=await api('/api/scenes/'+ls)}catch(e){}}
+ setMode(S.mode==='scene'?'scene':'chat');
 })();
 </script>
 </body>
