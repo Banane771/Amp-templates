@@ -273,5 +273,21 @@
     "IncludeInCommandLine": false,
     "DefaultValue": "",
     "EnumValues": {}
+  },
+  {
+    "DisplayName": "Statistiques RAM/CPU pour AMP",
+    "Category": "Ollama:smart_toy",
+    "Subcategory": "Avancé:tune:6",
+    "Description": "Affiche toutes les 10 s (60 s au repos) la consommation réelle d'Ollama et de ses modèles dans la console, pour qu'AMP en trace les graphiques.",
+    "Keywords": "stats,metrics,ram,cpu",
+    "FieldName": "StatsInConsole",
+    "InputType": "checkbox",
+    "ParamFieldName": "StatsInConsole",
+    "IncludeInCommandLine": false,
+    "DefaultValue": "1",
+    "EnumValues": {
+      "False": "0",
+      "True": "1"
+    }
   }
 ]

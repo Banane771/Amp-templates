@@ -46,6 +46,7 @@ OLLAMA_BIN = os.environ.get("OLLAMA_BIN", "").strip()
 WEB_SEARCH = (os.environ.get("WEB_SEARCH") or "off").strip().lower()
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "").strip().rstrip("/")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
+STATS = (os.environ.get("WEBUI_STATS") or "1").strip() not in ("0", "false", "False", "")
 UA = "Mozilla/5.0 (X11; Linux x86_64) OllamaChat/1.1"
 MAX_TOOL_ROUNDS = 6
 
@@ -254,7 +255,7 @@ def thread_summary(th, snippet=None):
 
 
 def list_threads():
-    out = [thread_summary(th) for th in all_threads()]
+    out = [dict(thread_summary(th), running=run_running("chat:" + th["id"])) for th in all_threads()]
     out.sort(key=lambda t: t["updated"], reverse=True)
     return out
 
@@ -577,6 +578,74 @@ def start_ollama():
     threading.Thread(target=watch, daemon=True).start()
 
 
+def _proc_table():
+    """Lit /proc : {pid: (ppid, ticks cpu, octets RAM)}."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    out = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % d, "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+            fields = raw[raw.rindex(")") + 2:].split()
+            # après « comm » : état(0) ppid(1) ... utime(11) stime(12) ... rss(21)
+            out[int(d)] = (int(fields[1]), int(fields[11]) + int(fields[12]), int(fields[21]) * page)
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+def tree_usage():
+    """CPU (ticks) et RAM (octets) d'OllamaChat + Ollama + ses runners, et présence d'un modèle chargé."""
+    table = _proc_table()
+    children = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    todo, seen = [os.getpid()], set()
+    while todo:
+        pid = todo.pop()
+        if pid in seen or pid not in table:
+            continue
+        seen.add(pid)
+        todo.extend(children.get(pid, []))
+    ticks = sum(table[p][1] for p in seen)
+    ram = sum(table[p][2] for p in seen)
+    runner = False
+    for pid in seen:
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                if b"runner" in f.read():
+                    runner = True
+                    break
+        except OSError:
+            pass
+    return ticks, ram, runner
+
+
+def stats_loop():
+    """Affiche la consommation réelle dans la console : AMP la lit via Console.MetricsRegex."""
+    hz = os.sysconf("SC_CLK_TCK")
+    ncpu = os.cpu_count() or 1
+    prev_ticks, prev_t = tree_usage()[0], time.monotonic()
+    every = int(os.environ.get("WEBUI_STATS_INTERVAL") or 0)
+    idle = 0
+    while True:
+        time.sleep(every or 10)
+        ticks, ram, runner = tree_usage()
+        now = time.monotonic()
+        cpu = max(0.0, (ticks - prev_ticks) / hz / max(now - prev_t, 0.001) / ncpu * 100)
+        prev_ticks, prev_t = ticks, now
+        # toutes les 10 s quand un modèle est chargé ou travaille, toutes les 60 s au repos
+        if not every and not runner and cpu < 2:
+            idle += 1
+            if idle % 6:
+                continue
+        else:
+            idle = 0
+        print("[Stats] RAM: %d Mo | CPU: %d %%" % (ram // 1048576, round(cpu)), flush=True)
+
+
 def shutdown(*_):
     global STOPPING
     STOPPING = True
@@ -785,7 +854,8 @@ def list_scenes():
                 out.append({"id": sc["id"], "title": sc.get("title") or "Scène sans titre",
                             "cast": [p.get("name", "") for p in scene_cast(sc)],
                             "narrator": sc.get("narrator", True), "updated": sc.get("updated", 0),
-                            "count": len(spoken(sc.get("turns", [])))})
+                            "count": len(spoken(sc.get("turns", []))),
+                            "running": run_running("scene:" + sc["id"])})
     out.sort(key=lambda s: s["updated"], reverse=True)
     return out
 
@@ -1001,6 +1071,77 @@ def block_request(sc, cast, turns, model, settings, direction="", lang="fr"):
     return body
 
 
+# ---------------------------------------------------------------- tâches de fond
+# Les générations tournent dans un thread, indépendamment de la page : si le navigateur coupe
+# la connexion (changement d'onglet, écran verrouillé), le travail continue et la page s'y
+# raccroche à son retour via /api/watch.
+
+RUNS = {}
+RUN_LOCK = threading.Lock()
+
+
+def run_running(key):
+    with RUN_LOCK:
+        st = RUNS.get(key)
+        return bool(st and st["running"])
+
+
+def run_start(key):
+    with RUN_LOCK:
+        now = time.time()
+        for k in [k for k, v in RUNS.items() if not v["running"] and now - v["ended"] > 1800]:
+            del RUNS[k]
+        st = RUNS.get(key)
+        if st and st["running"]:
+            return None
+        st = {"id": uuid.uuid4().hex, "running": True, "status": "", "live": None, "k": 0, "error": "",
+              "reason": "", "ended": 0, "saved": 0, "started": now}
+        RUNS[key] = st
+        return st
+
+
+def run_emitter(st):
+    """Remplace l'ancien envoi direct au navigateur : chaque événement met à jour l'état partagé."""
+    def new_live(extra=None):
+        st["k"] += 1
+        st["live"] = dict(extra or {}, k=st["k"], content="", thinking="", steps=[])
+
+    def emit(obj):
+        with RUN_LOCK:
+            if "status" in obj:
+                st["status"] = obj["status"] or ""
+            if obj.get("turn"):
+                new_live(obj["turn"])
+                st["status"] = ""
+            if obj.get("c") or obj.get("t"):
+                if st["live"] is None:
+                    new_live()
+                st["live"]["content"] += obj.get("c") or ""
+                st["live"]["thinking"] += obj.get("t") or ""
+            if obj.get("tool"):
+                if st["live"] is None:
+                    new_live()
+                st["live"]["steps"].append({"tool": obj["tool"], "arg": obj.get("arg", "")})
+            if obj.get("end_turn"):
+                st["live"] = None
+            if obj.get("saved"):
+                st["saved"] += 1
+            if obj.get("error"):
+                st["error"] = obj["error"]
+            if obj.get("done"):
+                st.update(running=False, reason=obj.get("reason", ""), ended=time.time(), live=None, status="")
+    return emit
+
+
+def run_snapshot(key):
+    with RUN_LOCK:
+        st = RUNS.get(key)
+        if not st:
+            return None
+        return json.loads(json.dumps({k: st[k] for k in
+                                      ("id", "running", "status", "live", "error", "reason", "saved", "ended")}))
+
+
 # ---------------------------------------------------------------- serveur web
 
 class Handler(BaseHTTPRequestHandler):
@@ -1076,6 +1217,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path.startswith("/api/ollama/"):
                 self.proxy(method, "/api/" + path[len("/api/ollama/"):])
+            elif path == "/api/watch" and method == "GET":
+                self.watch(q.get("key", ""))
             elif path == "/api/config" and method == "GET":
                 self.send_json({"web": web_enabled(), "webBackend": WEB_SEARCH})
             elif path == "/api/threads" and method == "GET":
@@ -1160,7 +1303,7 @@ class Handler(BaseHTTPRequestHandler):
             if not th:
                 return self.send_json({"error": "Fil introuvable"}, 404)
             if method == "GET":
-                return self.send_json(th)
+                return self.send_json(dict(th, running=run_running("chat:" + tid)))
             if method == "PUT":
                 b = self.body()
                 for k in ("title", "model"):
@@ -1178,6 +1321,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def chat(self, b):
         tid = b.get("thread", "")
+        if run_running("chat:" + tid):
+            return self.send_json({"error": "Une réponse est déjà en cours dans ce fil", "running": True}, 409)
         with LOCK:
             th = load_thread(tid)
             if not th:
@@ -1207,22 +1352,14 @@ class Handler(BaseHTTPRequestHandler):
         model = th["model"]
         use_web = bool(b.get("web")) and web_enabled()
         req_body, lang = build_request(th, get_settings(model, th.get("persona")), web=use_web)
+        st = run_start("chat:" + tid)
+        if st is None:
+            return self.send_json({"error": "Une réponse est déjà en cours dans ce fil", "running": True}, 409)
+        threading.Thread(target=self._chat_job, args=(tid, model, req_body, lang, use_web, run_emitter(st)),
+                         daemon=True).start()
+        self.send_json({"started": True, "id": st["id"]})
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        state = {"client": True}
-
-        def send(obj):
-            if not state["client"]:
-                return
-            try:
-                self.wfile.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
-            except OSError:
-                state["client"] = False  # on continue quand même pour enregistrer la réponse
+    def _chat_job(self, tid, model, req_body, lang, use_web, send):
 
         acc, think, stats, steps, sources = [], [], {}, [], []
         stopped = failed = False
@@ -1436,6 +1573,68 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "Méthode non prise en charge"}, 405)
 
 
+    # -- suivi d'une génération en cours (reconnexion possible à tout moment)
+    def watch(self, key):
+        if not re.fullmatch(r"(chat|scene):[a-f0-9]{32}", key or ""):
+            return self.send_json({"error": "Clé invalide"}, 400)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def out(obj):
+            self.wfile.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            last = run_snapshot(key)
+            out({"snap": last or {"running": False}})
+            if not last or not last["running"]:
+                return
+            beat = time.monotonic()
+            while True:
+                time.sleep(0.25)
+                cur = run_snapshot(key)
+                if cur is None:
+                    return
+                sent = False
+                if cur["saved"] != last["saved"]:
+                    out({"saved": cur["saved"]})
+                    sent = True
+                if cur["status"] != last["status"]:
+                    out({"status": cur["status"]})
+                    sent = True
+                L, P = cur["live"], last["live"]
+                if L and (not P or L["k"] != P["k"]):
+                    out({"turn": L})
+                    sent = True
+                elif L and P:
+                    dc, dt = L["content"][len(P["content"]):], L["thinking"][len(P["thinking"]):]
+                    if dc or dt:
+                        out({"c": dc, "t": dt})
+                        sent = True
+                    for step in L["steps"][len(P["steps"]):]:
+                        out({"tool": step["tool"], "arg": step["arg"]})
+                        sent = True
+                elif P and not L:
+                    out({"end_turn": True})
+                    sent = True
+                if cur["error"] and cur["error"] != last["error"]:
+                    out({"error": cur["error"]})
+                    sent = True
+                if not cur["running"]:
+                    out({"done": True, "reason": cur["reason"], "id": cur["id"], "error": cur["error"]})
+                    return
+                if not sent and time.monotonic() - beat > 15:
+                    out({"ping": 1})  # garde la connexion ouverte pendant les longues réflexions
+                    sent = True
+                if sent:
+                    beat = time.monotonic()
+                last = cur
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
     # -- scènes
     def scene_item(self, method, sid, action):
         if action == "stop":
@@ -1448,7 +1647,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sc:
                 return self.send_json({"error": "Scène introuvable"}, 404)
             if method == "GET":
-                return self.send_json(sc)
+                return self.send_json(dict(sc, running=run_running("scene:" + sid)))
             if method == "PUT":
                 b = self.body()
                 turns = sc.get("turns", [])
@@ -1466,6 +1665,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "Méthode non prise en charge"}, 405)
 
     def scene_run(self, sid, b):
+        if run_running("scene:" + sid):
+            return self.send_json({"error": "Cette scène est déjà en cours", "running": True}, 409)
         with LOCK:
             sc = load_scene(sid)
             if not sc:
@@ -1488,22 +1689,15 @@ class Handler(BaseHTTPRequestHandler):
         settings = get_settings(model)
         lang = scene_lang(sc, cast)
         block_name = TXT[lang]["scene"]
+        st = run_start("scene:" + sid)
+        if st is None:
+            return self.send_json({"error": "Cette scène est déjà en cours", "running": True}, 409)
+        threading.Thread(target=self._scene_job, daemon=True,
+                         args=(sid, sc, cast, model, direction, steps, settings, lang, block_name,
+                               run_emitter(st))).start()
+        self.send_json({"started": True, "id": st["id"]})
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        state = {"client": True}
-
-        def send(obj):
-            if not state["client"]:
-                return
-            try:
-                self.wfile.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
-            except OSError:
-                state["client"] = False  # la scène continue et s'enregistre quand même
+    def _scene_job(self, sid, sc, cast, model, direction, steps, settings, lang, block_name, send):
 
         def stream(body, strip_name=None):
             """Diffuse une génération ; renvoie (texte, interrompu)."""
@@ -1557,7 +1751,7 @@ class Handler(BaseHTTPRequestHandler):
                 if text.strip():
                     add_turn({"speaker": "block", "name": block_name, "content": text.strip(), "ts": time.time(),
                               "model": model, "stopped": stopped})
-                send({"end_turn": True})
+                send({"end_turn": True, "saved": bool(text.strip())})
                 reason = "stop" if stopped else "fin"
             else:
                 while True:
@@ -1596,7 +1790,7 @@ class Handler(BaseHTTPRequestHandler):
                     if text.strip():
                         add_turn({"speaker": who, "name": name, "content": text.strip(), "ts": time.time(),
                                   "model": model, "intention": intention, "stopped": stopped})
-                    send({"end_turn": True})
+                    send({"end_turn": True, "saved": bool(text.strip())})
                     done_now += 1
                     if stopped:
                         reason = "stop"
@@ -1850,6 +2044,35 @@ async function readNdjson(r,onLine){
   while((i=buf.indexOf('\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(line)onLine(JSON.parse(line))}}
 }
 
+/* ---------- suivi des générations en tâche de fond ---------- */
+// La génération tourne sur le serveur. La page s'y raccroche via /api/watch ; si le navigateur coupe
+// la connexion (onglet en arrière-plan, écran verrouillé), on se reconnecte au retour.
+const W={ctl:null,key:''};
+function stopWatch(){if(W.ctl){try{W.ctl.abort()}catch(e){}}W.ctl=null;W.key=''}
+async function watchRun(key,handler){
+ stopWatch();const ctl=new AbortController();W.ctl=ctl;W.key=key;
+ try{const r=await fetch('/api/watch?key='+key,{signal:ctl.signal});if(r.ok)await readNdjson(r,handler)}catch(e){}
+ finally{if(W.ctl===ctl){W.ctl=null;W.key=''}}
+}
+const seenRuns=new Set(store.get('seenRuns',[]));
+function markSeen(id){if(!id)return;seenRuns.add(id);store.set('seenRuns',[...seenRuns].slice(-50))}
+function unseenFinished(snap){return snap&&!snap.running&&snap.id&&!seenRuns.has(snap.id)&&snap.ended&&Date.now()/1000-snap.ended<1800}
+async function postJson(path,body){
+ const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ let d={};try{d=await r.json()}catch(e){}
+ if(!r.ok&&!d.running)throw new Error(d.error||r.statusText);
+ return d;
+}
+async function resync(){
+ // retour sur la page : on recharge l'élément affiché et on se raccroche s'il est encore en cours
+ stopWatch();
+ if(S.mode==='scene'){loadScenes();if(S.scene)await openScene(S.scene.id,true)}
+ else{loadThreads();if(S.thread)await openThread(S.thread.id,true)}
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')resync()});
+addEventListener('pageshow',e=>{if(e.persisted)resync()});
+addEventListener('online',()=>resync());
+
 /* ---------- markdown minimal ---------- */
 function inline(s){return esc(s)
  .replace(/`([^`\n]+)`/g,'<code>$1</code>')
@@ -1907,7 +2130,7 @@ async function loadThreads(){S.threads=await api('/api/threads').catch(()=>[]);r
 function threadRow(t){
  const p=S.personas.find(x=>x.id===t.persona);
  return '<div class="th'+(S.thread&&S.thread.id===t.id?' active':'')+'" data-id="'+t.id+'"><div class="t"><div>'+esc(t.title)+'</div>'
-  +(t.snippet?'<small class="snip">'+esc(t.snippet)+'</small>':'<small>'+(p?'🎭 '+esc(p.name)+' · ':'')+esc(t.model||'?')+' · '+new Date(t.updated*1000).toLocaleDateString('fr-FR')+'</small>')
+  +(t.snippet?'<small class="snip">'+esc(t.snippet)+'</small>':'<small>'+(t.running?'⏳ en cours · ':'')+(p?'🎭 '+esc(p.name)+' · ':'')+esc(t.model||'?')+' · '+new Date(t.updated*1000).toLocaleDateString('fr-FR')+'</small>')
   +'</div><button class="ghost" data-del="'+t.id+'" title="Supprimer">✕</button></div>';
 }
 let searchRes=null;
@@ -1919,10 +2142,41 @@ function renderThreads(){
 }
 let searchTimer=0;
 function onSearch(){clearTimeout(searchTimer);searchTimer=setTimeout(async()=>{const v=$('#search').value.trim();searchRes=v?await api('/api/search?q='+q(v)).catch(()=>[]):null;renderThreads()},250)}
-async function openThread(id){
- S.thread=await api('/api/threads/'+id);store.set('thread',id);
+async function openThread(id,quiet){
+ if(W.key&&W.key!=='chat:'+id)stopWatch();
+ let th;try{th=await api('/api/threads/'+id)}catch(e){if(!quiet)toast(e.message);return}
+ S.thread=th;store.set('thread',id);setBusy(false);
  if(S.thread.model&&S.thread.model!==S.model&&S.models.includes(S.thread.model)){S.model=S.thread.model;store.set('model',S.model);renderModelSelect()}
- await loadSettings();renderPersonaSelect();renderThreads();renderMessages(true);closeSide();
+ await loadSettings();renderPersonaSelect();renderThreads();renderMessages(true);if(!quiet)closeSide();
+ if(th.running)chatWatch(id,false);
+}
+function chatLive(){
+ const m=S.thread&&S.thread.messages,last=m&&m[m.length-1];
+ if(last&&last.live)return last;
+ const live={role:'assistant',content:'',thinking:'',model:S.model,live:true,steps:[]};if(m)m.push(live);return live;
+}
+function chatWatch(id,mine){
+ let err='';
+ watchRun('chat:'+id,d=>{
+  if(!S.thread||S.thread.id!==id)return;
+  if(d.snap){
+   if(!d.snap.running){finishChat(id,'',false);return}
+   setBusy(true);const L=chatLive();if(d.snap.live){L.content=d.snap.live.content||'';L.thinking=d.snap.live.thinking||'';L.steps=d.snap.live.steps||[]}
+  }
+  if(d.turn){const L=chatLive();L.content=d.turn.content||'';L.thinking=d.turn.thinking||'';L.steps=d.turn.steps||[]}
+  if(d.c||d.t){const L=chatLive();L.content+=d.c||'';L.thinking+=d.t||''}
+  if(d.tool)chatLive().steps.push({tool:d.tool,arg:d.arg});
+  if(d.error)err=d.error;
+  if(d.done){markSeen(d.id);finishChat(id,err||d.error||'',mine)}
+  schedule();
+ });
+}
+async function finishChat(id,err,mine){
+ setBusy(false);
+ try{const th=await api('/api/threads/'+id);if(S.thread&&S.thread.id===id)S.thread=th}catch(e){}
+ if(err){toast(err,6000);if(S.thread&&S.thread.id===id){const m=S.thread.messages,last=m[m.length-1];if(last&&last.role==='assistant')last.error=err;else m.push({role:'assistant',content:'',error:err,model:S.model})}}
+ renderMessages();loadThreads();
+ if(mine&&!err&&S.settings&&S.settings.autoMemory)memorize(true);
 }
 async function newThread(silent){
  S.thread=await api('/api/threads',{method:'POST',body:{model:S.model,persona:S.persona}});store.set('thread',S.thread.id);
@@ -1994,6 +2248,7 @@ function renderMessages(scroll){
 function setBusy(b){S.busy=b;const s=$('#sendBtn');s.textContent=b?'Stop':'Envoyer';s.classList.toggle('primary',!b);s.classList.toggle('danger',b)}
 async function send(regenerate){
  if(S.busy)return;
+ if(S.thread&&S.thread.running){toast('Une réponse est déjà en cours');return}
  const ta=$('#input');let text=ta.value.trim();
  if(!regenerate&&!text&&!S.attach.length)return;
  if(!S.model){toast('Choisis ou télécharge un modèle');return}
@@ -2006,20 +2261,12 @@ async function send(regenerate){
   th.messages.push({role:'user',content:text,images});ta.value='';autosize();
   if(!th.title){th.title=(text.split(FILE_SEP)[0]||'Image').slice(0,60);renderThreads()}
  }
- const live={role:'assistant',content:'',thinking:'',model:S.model,live:true,steps:[]};th.messages.push(live);
- renderMessages(true);setBusy(true);
- let err='';
+ chatLive();renderMessages(true);setBusy(true);
  try{
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({thread:th.id,content:text,images,model:S.model,regenerate:!!regenerate,web:S.config.web&&S.web})});
-  if(!r.ok){let e;try{e=(await r.json()).error}catch(x){e=r.statusText}throw new Error(e)}
-  await readNdjson(r,d=>{if(d.error)err=d.error;if(d.c)live.content+=d.c;if(d.t)live.thinking+=d.t;if(d.tool)live.steps.push({tool:d.tool,arg:d.arg});schedule()});
- }catch(e){err=e.message}
- setBusy(false);
- if(err)toast(err,6000);
- try{S.thread=await api('/api/threads/'+th.id)}catch(e){live.live=false;live.error=err}
- if(err&&S.thread){const last=S.thread.messages[S.thread.messages.length-1];if(last&&last.role==='assistant')last.error=err;else S.thread.messages.push({role:'assistant',content:'',error:err,model:S.model})}
- renderMessages();loadThreads();
- if(!err&&S.settings&&S.settings.autoMemory)memorize(true);
+  await postJson('/api/chat',{thread:th.id,content:text,images,model:S.model,regenerate:!!regenerate,web:S.config.web&&S.web});
+ }catch(e){return finishChat(th.id,e.message,false)}
+ loadThreads();
+ chatWatch(th.id,true);
 }
 async function stop(){if(S.thread)await api('/api/stop',{method:'POST',body:{thread:S.thread.id}}).catch(()=>{})}
 async function memorize(quiet){
@@ -2120,10 +2367,13 @@ function setMode(m){
  $('#chatTools').hidden=sc;$('#chatSub').hidden=sc;$('#chatFoot').hidden=sc;$('#sceneSub').hidden=!sc;$('#sceneFoot').hidden=!sc;
  $('#renameBtn').title=sc?'Modifier la scène':'Renommer le fil';
  renderThreads();renderMessages(true);
+ stopWatch();
+ if(sc&&S.scene)sceneWatch(S.scene.id);
+ if(!sc&&S.thread&&S.thread.running)chatWatch(S.thread.id,false);
 }
 async function loadScenes(){S.scenes=await api('/api/scenes').catch(()=>[]);if(S.mode==='scene')renderScenes()}
 function renderScenes(){
- $('#threads').innerHTML=S.scenes.length?S.scenes.map(s=>'<div class="th'+(S.scene&&S.scene.id===s.id?' active':'')+'" data-sid="'+s.id+'"><div class="t"><div>🎬 '+esc(s.title)+'</div><small>'+esc(s.cast.join(', ')||'aucun personnage')+' · '+s.count+' interv. · '+new Date(s.updated*1000).toLocaleDateString('fr-FR')+'</small></div><button class="ghost" data-delscene="'+s.id+'" title="Supprimer">✕</button></div>').join(''):'<div class="note" style="padding:10px">Aucune scène pour l\'instant.</div>';
+ $('#threads').innerHTML=S.scenes.length?S.scenes.map(s=>'<div class="th'+(S.scene&&S.scene.id===s.id?' active':'')+'" data-sid="'+s.id+'"><div class="t"><div>🎬 '+esc(s.title)+'</div><small>'+(s.running?'⏳ en cours · ':'')+esc(s.cast.join(', ')||'aucun personnage')+' · '+s.count+' interv. · '+new Date(s.updated*1000).toLocaleDateString('fr-FR')+'</small></div><button class="ghost" data-delscene="'+s.id+'" title="Supprimer">✕</button></div>').join(''):'<div class="note" style="padding:10px">Aucune scène pour l\'instant.</div>';
  $('#title').textContent=S.scene?(S.scene.title||'Scène sans titre'):'';
 }
 function colorOf(t){if(t.speaker==='narrator'||t.speaker==='block')return 'var(--muted)';const i=(S.scene.personas||[]).indexOf(t.speaker);return 'var(--c'+((i<0?0:i)%6)+')'}
@@ -2131,7 +2381,7 @@ function turnHtml(t,i,isLastSpoken,live){
  if(t.speaker==='direction')return '<div class="turn dir"><span>📝 Consigne : '+esc(t.content)+'</span>'+(live?'':'<button class="ghost" data-cut="'+i+'" title="Supprimer cette consigne et la suite">✕</button>')+'</div>';
  const narr=t.speaker==='narrator'||t.speaker==='block';
  let h='<div class="turn'+(narr?' narr':'')+'"><div class="who" style="color:'+colorOf(t)+'">'+esc(t.name||'?')+(t.stopped?' <small>· interrompu</small>':'');
- if(!live&&!S.busy){if(isLastSpoken)h+='<button class="ghost" data-regen="'+i+'" title="Réécrire cette intervention">↻</button>';h+='<button class="ghost" data-cut="'+i+'" title="Supprimer cette intervention et la suite">✕</button>'}
+ if(!live&&!S.sceneBusy){if(isLastSpoken)h+='<button class="ghost" data-regen="'+i+'" title="Réécrire cette intervention">↻</button>';h+='<button class="ghost" data-cut="'+i+'" title="Supprimer cette intervention et la suite">✕</button>'}
  return h+'</div><div class="bubble'+(live?' cursor':'')+'">'+md(t.content)+'</div></div>';
 }
 function renderScene(scroll){
@@ -2146,21 +2396,58 @@ function renderScene(scroll){
 }
 function updateSceneBar(){
  const sc=S.scene,b=$('#playBtn'),st=$('#stepBtn');
- $('#sceneStatus').textContent=S.status||'';
+ $('#sceneStatus').textContent=S.live?'✍️ '+(S.live.name||'')+' écrit…':(S.status||'');
  const rg=$('#regenBtn'),rs=$('#sceneReset');
  if(!sc){$('#castLine').textContent='';b.disabled=st.disabled=rg.disabled=rs.disabled=true;$('#sceneEdit').disabled=$('#sceneCopy').disabled=true;return}
  $('#sceneEdit').disabled=$('#sceneCopy').disabled=false;
  const names=(sc.personas||[]).map(id=>(S.personas.find(p=>p.id===id)||{}).name).filter(Boolean);
  const n=spokenTurns(sc).length,block=sc.mode==='block';
  $('#castLine').innerHTML='🎭 <b>'+esc(names.join(', ')||'aucun personnage')+'</b>'+(sc.narrator?' · Narrateur':'')+' · '+(block?'d\'un seul bloc':n+'/'+sc.maxTurns+' interv.');
- st.hidden=block;b.disabled=false;rg.disabled=rs.disabled=S.busy||!n;
- if(S.busy){b.textContent='■ Stop';b.classList.remove('primary');b.classList.add('danger');st.disabled=true}
+ st.hidden=block;b.disabled=false;rg.disabled=rs.disabled=S.sceneBusy||!n;
+ if(S.sceneBusy){b.textContent='■ Stop';b.classList.remove('primary');b.classList.add('danger');st.disabled=true}
  else{b.classList.add('primary');b.classList.remove('danger');st.disabled=n>=sc.maxTurns;
   b.textContent=block?(n?'▶ Poursuivre':'▶ Écrire la scène'):(n>=sc.maxTurns?'▶ Prolonger (+4)':n?'▶ Continuer':'▶ Jouer')}
 }
-async function openScene(id){
- try{S.scene=await api('/api/scenes/'+id)}catch(e){toast(e.message);return}
- store.set('scene',id);renderScenes();renderScene(true);closeSide();
+async function openScene(id,quiet){
+ if(W.key&&W.key!=='scene:'+id)stopWatch();
+ let sc;try{sc=await api('/api/scenes/'+id)}catch(e){if(!quiet)toast(e.message);return}
+ S.scene=sc;S.sceneBusy=false;S.live=null;S.status='';
+ store.set('scene',id);renderScenes();renderScene(true);if(!quiet)closeSide();
+ sceneWatch(id);
+}
+function sceneWatch(id){
+ let err='';
+ watchRun('scene:'+id,d=>{
+  if(!S.scene||S.scene.id!==id)return;
+  if(d.snap){
+   if(!d.snap.running){
+    if(S.sceneBusy)finishScene(id,'',{});
+    else if(unseenFinished(d.snap)){markSeen(d.snap.id);sceneToast(d.snap.reason,d.snap.error,true)}
+    return}
+   S.sceneBusy=true;S.status=d.snap.status||'';S.live=d.snap.live?{speaker:d.snap.live.speaker,name:d.snap.live.name,content:d.snap.live.content||''}:null;
+  }
+  if(d.status!==undefined)S.status=d.status;
+  if(d.turn){S.live={speaker:d.turn.speaker,name:d.turn.name,content:d.turn.content||''};S.status=''}
+  if(d.c&&S.live)S.live.content+=d.c;
+  if(d.saved){S.live=null;api('/api/scenes/'+id).then(x=>{if(S.scene&&S.scene.id===id){S.scene=x;schedule()}}).catch(()=>{})}
+  if(d.end_turn)S.live=null;
+  if(d.error)err=d.error;
+  if(d.done){markSeen(d.id);finishScene(id,err||d.error||'',d)}
+  schedule();
+ });
+}
+function sceneToast(reason,err,away){
+ const suf=away?' pendant ton absence':'';
+ if(err)toast(err,6000);
+ else if(reason==='fin')toast('🎬 Scène terminée'+suf,4000);
+ else if(reason==='limite')toast('Limite de '+(S.scene?S.scene.maxTurns:'')+' interventions atteinte'+suf,4000);
+ else if(reason==='stop')toast('Scène interrompue');
+}
+async function finishScene(id,err,d){
+ S.sceneBusy=false;S.live=null;S.status='';
+ try{const sc=await api('/api/scenes/'+id);if(S.scene&&S.scene.id===id)S.scene=sc}catch(e){}
+ renderScene();loadScenes();
+ sceneToast(d&&d.reason,err,false);
 }
 async function delScene(id){
  if(!confirm('Supprimer cette scène ?'))return;
@@ -2195,33 +2482,18 @@ async function saveScene(){
  catch(x){toast(x.message,5000)}
 }
 async function runScene(opts={}){
- const sc=S.scene;if(!sc||S.busy)return;
+ const sc=S.scene;if(!sc||S.sceneBusy)return;
  if(!S.model){toast('Choisis ou télécharge un modèle');return}
  if(sc.mode!=='block'&&!opts.steps&&spokenTurns(sc).length>=sc.maxTurns){
   try{S.scene=await api('/api/scenes/'+sc.id,{method:'PUT',body:{maxTurns:sc.maxTurns+4}})}catch(e){toast(e.message);return}
  }
  const direction=$('#dirInput').value.trim();$('#dirInput').value='';autosizeDir();
  if(direction)S.scene.turns.push({speaker:'direction',content:direction});
- S.busy=true;S.status='Préparation…';renderScene(true);
- let err='',reason='';
- try{
-  const r=await fetch('/api/scenes/'+sc.id+'/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:S.model,direction,steps:opts.steps||0})});
-  if(!r.ok){let e;try{e=(await r.json()).error}catch(x){e=r.statusText}throw new Error(e)}
-  await readNdjson(r,d=>{
-   if(d.status)S.status=d.status;
-   if(d.turn){S.live={speaker:d.turn.speaker,name:d.turn.name,content:''};S.status='✍️ '+d.turn.name+' écrit…'}
-   if(d.c&&S.live)S.live.content+=d.c;
-   if(d.end_turn){if(S.live&&S.live.content.trim())S.scene.turns.push(Object.assign({},S.live,{content:S.live.content.trim()}));S.live=null}
-   if(d.error)err=d.error;if(d.done)reason=d.reason;
-   schedule()});
- }catch(e){err=e.message}
- S.busy=false;S.live=null;S.status='';
- try{S.scene=await api('/api/scenes/'+sc.id)}catch(e){}
- renderScene();loadScenes();
- if(err)toast(err,6000);
- else if(reason==='fin')toast('🎬 Scène terminée',3500);
- else if(reason==='limite')toast('Limite de '+S.scene.maxTurns+' interventions atteinte',3500);
- else if(reason==='stop')toast('Scène interrompue');
+ S.sceneBusy=true;S.status='Préparation…';renderScene(true);
+ try{await postJson('/api/scenes/'+sc.id+'/run',{model:S.model,direction,steps:opts.steps||0})}
+ catch(e){S.sceneBusy=false;S.status='';renderScene();toast(e.message,6000);return}
+ loadScenes();
+ sceneWatch(sc.id);
 }
 async function stopScene(){if(S.scene)await api('/api/scenes/'+S.scene.id+'/stop',{method:'POST',body:{}}).catch(()=>{})}
 async function cutScene(i,regen){
@@ -2245,13 +2517,13 @@ $('#tabChat').onclick=()=>setMode('chat');
 $('#tabScene').onclick=()=>setMode('scene');
 $('#sceneEdit').onclick=()=>S.scene&&panelScene(S.scene);
 $('#sceneCopy').onclick=()=>{if(!S.scene)return;const t=sceneText(S.scene);if(!t){toast('La scène est vide');return}navigator.clipboard.writeText(t).then(()=>toast('Scène copiée'),()=>toast('Copie impossible'))};
-$('#playBtn').onclick=()=>S.busy?stopScene():runScene({});
+$('#playBtn').onclick=()=>S.sceneBusy?stopScene():runScene({});
 $('#stepBtn').onclick=()=>runScene({steps:1});
-$('#regenBtn').onclick=()=>{if(!S.scene||S.busy)return;const t=S.scene.turns||[];let i=-1;t.forEach((x,k)=>{if(x.speaker!=='direction')i=k});if(i>=0)cutScene(i,true)};
-$('#sceneReset').onclick=async()=>{if(!S.scene||S.busy)return;if(!confirm('Effacer toute la scène et la rejouer depuis le début ?'))return;
+$('#regenBtn').onclick=()=>{if(!S.scene||S.sceneBusy)return;const t=S.scene.turns||[];let i=-1;t.forEach((x,k)=>{if(x.speaker!=='direction')i=k});if(i>=0)cutScene(i,true)};
+$('#sceneReset').onclick=async()=>{if(!S.scene||S.sceneBusy)return;if(!confirm('Effacer toute la scène et la rejouer depuis le début ?'))return;
  try{S.scene=await api('/api/scenes/'+S.scene.id,{method:'PUT',body:{truncate:0}})}catch(e){toast(e.message);return}renderScene(true);loadScenes();runScene({})};
 $('#dirInput').addEventListener('input',autosizeDir);
-$('#dirInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!coarse){e.preventDefault();if(!S.busy)runScene({})}});
+$('#dirInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!coarse){e.preventDefault();if(!S.sceneBusy)runScene({})}});
 $('#search').addEventListener('input',onSearch);
 $('#filter').checked=S.filter;$('#filter').onchange=e=>{S.filter=e.target.checked;store.set('filter',S.filter);renderThreads()};
 $('#model').onchange=e=>setModel(e.target.value);
@@ -2325,6 +2597,8 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     start_ollama()
+    if STATS:
+        threading.Thread(target=stats_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     print("OllamaChat : interface web sur le port %d (Ollama : %s, données : %s, recherche web : %s)"
