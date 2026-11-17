@@ -1153,6 +1153,8 @@ def speaker_request(sc, cast, turns, speaker, intention, model, settings, direct
     sp = spoken(turns)
     remaining = sc["maxTurns"] - len(sp)
     num_predict, length_txt = length_rule(sc, lang)
+    if sc.get("think"):
+        num_predict += 2048  # place pour la réflexion, qui compte dans la limite de longueur
     others = [p["name"] for p in cast if p["id"] != speaker]
     if speaker == "narrator":
         name = L["narrator"]
@@ -1194,6 +1196,8 @@ def block_request(sc, cast, turns, model, settings, direction="", lang="fr"):
             f += "\n" + (L["memories_of"] % p["name"]) + "\n" + mem
         fiches.append(f)
     num_predict, _ = length_rule(sc, lang)
+    if sc.get("think"):
+        num_predict += 1024 // max(1, sc["maxTurns"])
     system = L["block_system"] % (sc.get("prompt", "").strip() or L["none"], "\n\n".join(fiches) or "-",
                                   L["block_narr"] if sc.get("narrator") else L["block_nonarr"], sc["maxTurns"])
     if direction:
@@ -1976,6 +1980,14 @@ class Handler(BaseHTTPRequestHandler):
                     name, body = speaker_request(sc, cast, turns, who, intention, model, settings, direction, lang)
                     send({"turn": {"speaker": who, "name": name, "intention": intention}})
                     text, stopped, cut, info = stream(body, strip_name=name)
+                    if (not text.strip() and not stopped and info["done_reason"] == "length"
+                            and info["thinking"] and sid not in STOPS):
+                        # le modèle a épuisé sa limite à réfléchir : on relance avec la place de finir puis d'écrire
+                        print("OllamaChat : %s a épuisé sa limite en réfléchissant, nouvel essai avec plus de place."
+                              % name, flush=True)
+                        send({"status": "Réflexion longue, nouvel essai…"})
+                        body["options"]["num_predict"] = body["options"].get("num_predict", 700) + 2048
+                        text, stopped, cut, info = stream(body, strip_name=name)
                     if not text.strip() and not stopped:
                         th = "".join(info["thinking"])
                         print("OllamaChat : %s n'a renvoyé aucun texte (fin : %s, réflexion : %d caractères). Début de la réflexion : %r"
@@ -2676,7 +2688,7 @@ function panelScene(sc){
  +'<div class="row"><div class="field"><span>Interventions maximum</span><input id="eMax" type="number" min="1" max="120" inputmode="numeric" value="'+e.maxTurns+'"></div>'
  +'<div class="field"><span>Longueur des interventions</span><select id="eLen">'+opt('courte',e.length,'Courte')+opt('moyenne',e.length,'Moyenne')+opt('longue',e.length,'Longue')+'</select></div></div>'
  +'<div class="field"><span>Langue d\'écriture</span><select id="eLang">'+opt('auto',e.lang,'Automatique (d\'après le prompt et les fiches)')+opt('en',e.lang,'English')+opt('fr',e.lang,'Français')+'</select></div>'
- +'<div class="field check"><input type="checkbox" id="eThink"'+(e.think?' checked':'')+'><label for="eThink">Laisser le modèle réfléchir avant chaque intervention (meilleur, mais bien plus lent en CPU)</label></div>'
+ +'<div class="field check"><input type="checkbox" id="eThink"'+(e.think?' checked':'')+'><label for="eThink">Laisser le modèle réfléchir avant chaque intervention (scènes plus fidèles au déroulé prévu, mais plus lent)</label></div>'
  +'<div class="note">Le modèle utilisé est celui sélectionné en haut au moment de jouer.</div>'
  +'<div class="row" style="margin-top:12px">'+(sc?'<button class="danger" id="eDel">Supprimer</button>':'')+'<span></span><button class="primary" id="eSave">Enregistrer</button></div>','scene');
  $('#box').dataset.sid=sc?sc.id:'';
