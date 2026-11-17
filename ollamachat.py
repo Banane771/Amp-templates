@@ -623,10 +623,54 @@ def tree_usage():
     return ticks, ram, runner
 
 
+def container_limits():
+    """Limites réellement allouées : celles du conteneur (cgroup) si elles existent, sinon la machine."""
+    ram = None
+    for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(f).read().strip()
+            if v != "max" and int(v) < (1 << 60):
+                ram = int(v)
+                break
+        except (OSError, ValueError):
+            pass
+    if ram is None:
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemTotal:"):
+                    ram = int(line.split()[1]) * 1024
+                    break
+        except (OSError, ValueError, IndexError):
+            ram = 0
+    cores = float(os.cpu_count() or 1)
+    try:
+        cores = min(cores, float(len(os.sched_getaffinity(0))))
+    except (AttributeError, OSError):
+        pass
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if quota != "max":
+            cores = min(cores, int(quota) / int(period))
+    except (OSError, ValueError):
+        try:
+            quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+            if quota > 0:
+                cores = min(cores, quota / period)
+        except (OSError, ValueError):
+            pass
+    return ram, max(cores, 0.01)
+
+
 def stats_loop():
-    """Affiche la consommation réelle dans la console : AMP la lit via Console.MetricsRegex."""
+    """Affiche la consommation réelle dans la console : AMP la lit via Console.MetricsRegex.
+    CPU : 100 % = tous les cœurs alloués au conteneur (ou à la machine s'il n'y a pas de limite)."""
     hz = os.sysconf("SC_CLK_TCK")
-    ncpu = os.cpu_count() or 1
+    ram_max, cores = container_limits()
+    print("OllamaChat : limites vues pour les statistiques : RAM %d Mo, CPU %g cœur(s)" % (ram_max // 1048576, cores),
+          flush=True)
+    # Valeurs de référence envoyées une fois : AMP retient la plus haute valeur vue comme maximum de la jauge.
+    print("[Stats] RAM: %d Mo | CPU: 100 %%" % (ram_max // 1048576), flush=True)
     prev_ticks, prev_t = tree_usage()[0], time.monotonic()
     every = int(os.environ.get("WEBUI_STATS_INTERVAL") or 0)
     idle = 0
@@ -634,7 +678,7 @@ def stats_loop():
         time.sleep(every or 10)
         ticks, ram, runner = tree_usage()
         now = time.monotonic()
-        cpu = max(0.0, (ticks - prev_ticks) / hz / max(now - prev_t, 0.001) / ncpu * 100)
+        cpu = max(0.0, min(100.0, (ticks - prev_ticks) / hz / max(now - prev_t, 0.001) / cores * 100))
         prev_ticks, prev_t = ticks, now
         # toutes les 10 s quand un modèle est chargé ou travaille, toutes les 60 s au repos
         if not every and not runner and cpu < 2:
@@ -662,11 +706,11 @@ def shutdown(*_):
 # ---------------------------------------------------------------- scènes
 
 LENGTHS = {
-    "courte": (180, {"fr": "Ton intervention est courte : une à trois phrases.",
+    "courte": (300, {"fr": "Ton intervention est courte : une à trois phrases.",
                      "en": "Keep your turn short: one to three sentences."}),
-    "moyenne": (400, {"fr": "Ton intervention tient en un court paragraphe.",
+    "moyenne": (700, {"fr": "Ton intervention tient en un court paragraphe.",
                       "en": "Your turn is one short paragraph."}),
-    "longue": (850, {"fr": "Ton intervention peut être développée : un ou deux paragraphes.",
+    "longue": (1400, {"fr": "Ton intervention peut être développée : un ou deux paragraphes.",
                      "en": "Your turn can be developed: one or two paragraphs."}),
 }
 SCENE_DEFAULTS = {"title": "", "personas": [], "prompt": "", "narrator": True, "mode": "turns",
@@ -990,16 +1034,61 @@ def gen_options(sc, settings, num_predict=None, stop=None):
     return opts
 
 
+MODEL_CAPS = {}
+
+
+def model_caps(model):
+    """Capacités annoncées par Ollama pour un modèle (thinking, tools, vision…), mises en cache."""
+    if model in MODEL_CAPS:
+        return MODEL_CAPS[model]
+    try:
+        with ollama_post("/api/show", {"model": model}, timeout=20) as r:
+            caps = json.load(r).get("capabilities")
+    except Exception:
+        caps = None
+    if caps is not None:
+        MODEL_CAPS[model] = caps
+    return caps
+
+
 def ollama_call(body):
-    """Ouvre un appel /api/chat ; réessaie sans « think » si le modèle ne le gère pas."""
+    """Ouvre un appel /api/chat. L'option « think » n'est envoyée qu'aux modèles qui la gèrent ;
+    si Ollama la refuse malgré tout, on réessaie sans (et on le note dans la console)."""
+    if "think" in body:
+        caps = model_caps(body.get("model", ""))
+        if caps is not None and "thinking" not in caps:
+            body.pop("think")
     try:
         return ollama_post("/api/chat", body)
     except urllib.error.HTTPError as e:
         err = http_error_text(e)
         if "think" in body and "think" in err.lower():
+            print("OllamaChat : Ollama refuse l'option de réflexion pour %s (%s), nouvel essai sans."
+                  % (body.get("model"), err), flush=True)
             body.pop("think")
             return ollama_post("/api/chat", body)
         raise RuntimeError(err)
+
+
+def trim_to_sentence(text):
+    """Si la génération a été coupée par la limite de longueur, on s'arrête à la dernière phrase
+    complète (ou action *…* fermée) plutôt que de laisser une phrase en suspens."""
+    t = text.rstrip()
+    ends = list(re.finditer(r"[.!?…](?:[\"»”’')\]]|\*)*(?=\s|$)|(?<=\S)\*(?=\s|$)", t))
+    if ends and ends[-1].end() >= len(t) * 0.35:
+        t = t[:ends[-1].end()]
+    else:
+        sp = t.rfind(" ")
+        t = (t[:sp] if sp > 0 else t).rstrip(" ,;:—-") + "…"
+    if t.count("*") % 2:
+        t += "*"
+    if t.count('"') % 2:
+        t += '"'
+    if t.count("«") > t.count("»"):
+        t += " »"
+    if t.count("“") > t.count("”"):
+        t += "”"
+    return t
 
 
 def scene_common(sc, cast, lang):
@@ -1268,6 +1357,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.proxy(method, "/api/" + path[len("/api/ollama/"):])
             elif path == "/api/watch" and method == "GET":
                 self.watch(q.get("key", ""))
+            elif path == "/api/fixmodel" and method == "POST":
+                self.fix_model(self.body())
             elif path == "/api/config" and method == "GET":
                 self.send_json({"web": web_enabled(), "webBackend": WEB_SEARCH})
             elif path == "/api/threads" and method == "GET":
@@ -1622,6 +1713,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "Méthode non prise en charge"}, 405)
 
 
+    # -- réparation d'un Gemma 4 importé depuis Hugging Face
+    def fix_model(self, b):
+        """Les GGUF Gemma 4 téléchargés via hf.co reçoivent un modèle de conversation générique dans
+        Ollama : on recrée le modèle en forçant le traitement dédié (RENDERER / PARSER gemma4)."""
+        src = str(b.get("model") or "").strip()
+        if not src:
+            return self.send_json({"error": "Modèle manquant"}, 400)
+        if not OLLAMA_BIN:
+            return self.send_json({"error": "Ollama n'est pas lancé par OllamaChat : réparation impossible ici"}, 400)
+        repo, _, tag = src.split("/")[-1].partition(":")
+        base = re.sub(r"-?gguf$", "", re.sub(r"[^a-z0-9._-]+", "-", repo.lower())).strip("-.") or "gemma4"
+        target = "%s-ollama:%s" % (base, re.sub(r"[^a-z0-9._-]+", "-", (tag or "latest").lower()))
+        low = src.lower()
+        large = any(x in low for x in ("12b", "26b", "31b")) and not any(x in low for x in ("e2b", "e4b"))
+        renderers = ["gemma4-large", "gemma4"] if large else ["gemma4", "gemma4-large"]
+        log = []
+        for rend in renderers:
+            mf = os.path.join(DATA, "Modelfile.fix")
+            with open(mf, "w", encoding="utf-8") as fh:
+                fh.write("FROM %s\nRENDERER %s\nPARSER gemma4\n" % (src, rend))
+            try:
+                r = subprocess.run(shlex.split(OLLAMA_BIN) + ["create", target, "-f", mf],
+                                   capture_output=True, text=True, timeout=900, env=os.environ.copy())
+            except Exception as e:
+                return self.send_json({"error": "Échec de la commande ollama create : %s" % e}, 500)
+            out = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", (r.stdout or "") + (r.stderr or "")).strip()
+            log.append("[%s] %s" % (rend, out[-400:]))
+            print("OllamaChat : réparation de %s avec RENDERER %s → code %s" % (src, rend, r.returncode), flush=True)
+            if r.returncode == 0:
+                MODEL_CAPS.pop(target, None)
+                return self.send_json({"ok": True, "model": target, "renderer": rend})
+        self.send_json({"error": "La réparation a échoué : " + " | ".join(log)}, 500)
+
     # -- suivi d'une génération en cours (reconnexion possible à tout moment)
     def watch(self, key):
         if not re.fullmatch(r"(chat|scene):[a-f0-9]{32}", key or ""):
@@ -1749,20 +1873,27 @@ class Handler(BaseHTTPRequestHandler):
     def _scene_job(self, sid, sc, cast, model, direction, steps, settings, lang, block_name, send):
 
         def stream(body, strip_name=None):
-            """Diffuse une génération ; renvoie (texte, interrompu)."""
-            acc, buf, flushed = [], "", strip_name is None
+            """Diffuse une génération ; renvoie (texte, interrompu, coupé par la limite de longueur)."""
+            acc, buf, flushed, cut = [], "", strip_name is None, False
+            info = {"thinking": [], "done_reason": ""}
             pat = re.compile(r"^\s*\**\s*%s\s*\**\s*[:：]\s*(?:\*\*\s+)?" % re.escape(strip_name), re.I) if strip_name else None
             resp = ollama_call(body)
             try:
                 for line in resp:
                     if sid in STOPS:
-                        return "".join(acc), True
+                        return "".join(acc), True, False, info
                     line = line.strip()
                     if not line:
                         continue
                     d = json.loads(line)
                     if d.get("error"):
                         raise RuntimeError(d["error"])
+                    if d.get("done"):
+                        info["done_reason"] = d.get("done_reason") or ""
+                        if d.get("done_reason") == "length":
+                            cut = True
+                    if (d.get("message") or {}).get("thinking"):
+                        info["thinking"].append(d["message"]["thinking"])
                     c = (d.get("message") or {}).get("content") or ""
                     if (d.get("message") or {}).get("thinking") and not acc and not buf:
                         send({"status": "Réflexion…"})
@@ -1782,7 +1913,7 @@ class Handler(BaseHTTPRequestHandler):
                 c = pat.sub("", buf, count=1)
                 acc.append(c)
                 send({"c": c})
-            return "".join(acc), False
+            return "".join(acc), False, cut, info
 
         def add_turn(turn):
             with LOCK:
@@ -1791,12 +1922,21 @@ class Handler(BaseHTTPRequestHandler):
                 save_scene(cur)
                 sc["turns"] = cur["turns"]
 
-        reason, done_now = "limite", 0
+        reason, done_now, empty_runs = "limite", 0, 0
         STOPS.discard(sid)
         try:
             if sc.get("mode") == "block":
                 send({"turn": {"speaker": "block", "name": block_name}})
-                text, stopped = stream(block_request(sc, cast, sc.get("turns", []), model, settings, direction, lang))
+                text, stopped, cut, info = stream(block_request(sc, cast, sc.get("turns", []), model, settings, direction, lang))
+                if not text.strip() and not stopped:
+                    th = "".join(info["thinking"])
+                    print("OllamaChat : %s n'a renvoyé aucun texte (fin : %s, réflexion : %d caractères). Début de la réflexion : %r"
+                          % (block_name, info["done_reason"] or "?", len(th), th[:200]), flush=True)
+                if not text.strip() and not stopped:
+                    send({"error": "Le modèle n'a renvoyé aucun texte. Le détail est dans la console d'AMP."})
+                if cut and text.strip():
+                    text = trim_to_sentence(text)
+                    print("OllamaChat : scène coupée par la limite de longueur, terminée à la dernière phrase complète.", flush=True)
                 if text.strip():
                     add_turn({"speaker": "block", "name": block_name, "content": text.strip(), "ts": time.time(),
                               "model": model, "stopped": stopped})
@@ -1835,7 +1975,26 @@ class Handler(BaseHTTPRequestHandler):
                             who = "narrator" if (sc.get("narrator") and not sp) else fallback_next(sc, cast, turns)
                     name, body = speaker_request(sc, cast, turns, who, intention, model, settings, direction, lang)
                     send({"turn": {"speaker": who, "name": name, "intention": intention}})
-                    text, stopped = stream(body, strip_name=name)
+                    text, stopped, cut, info = stream(body, strip_name=name)
+                    if not text.strip() and not stopped:
+                        th = "".join(info["thinking"])
+                        print("OllamaChat : %s n'a renvoyé aucun texte (fin : %s, réflexion : %d caractères). Début de la réflexion : %r"
+                              % (name, info["done_reason"] or "?", len(th), th[:200]), flush=True)
+                        empty_runs += 1
+                        if empty_runs >= 2:
+                            send({"end_turn": True})
+                            send({"error": "Le modèle n'a renvoyé aucun texte pour deux interventions de suite. "
+                                           "Le détail est dans la console d'AMP (s'il s'agit d'un Gemma 4 venu de "
+                                           "Hugging Face, utilise 🔧 Réparer dans 📦)."})
+                            reason = "erreur"
+                            break
+                    else:
+                        empty_runs = 0
+                    if cut and text.strip():
+                        text = trim_to_sentence(text)
+                        print("OllamaChat : intervention de %s coupée par la limite de longueur (%s tokens), "
+                              "terminée à la dernière phrase complète." % (name, body["options"].get("num_predict")),
+                              flush=True)
                     if text.strip():
                         add_turn({"speaker": who, "name": name, "content": text.strip(), "ts": time.time(),
                                   "model": model, "intention": intention, "stopped": stopped})
@@ -2339,7 +2498,7 @@ async function panelModels(){
  const exp=t=>{const d=new Date(t);return d.getFullYear()>2200?'jamais':'à '+d.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'})};
  $('#pm').innerHTML='<h3>Chargés en mémoire</h3>'+(ps.length?ps.map(m=>'<div class="card"><div class="row"><div><b>'+esc(m.name)+'</b><br><small>'+gb(m.size)+' en RAM · déchargement '+exp(m.expires_at)+'</small></div><button data-unload="'+esc(m.name)+'">Décharger</button></div></div>').join(''):'<div class="note">Aucun modèle chargé : la RAM est libre.</div>')
  +'<h3>Télécharger</h3><div class="row"><input id="pullName" placeholder="ex. qwen3:8b ou hf.co/utilisateur/depot:Q4_K_M"><button class="primary" id="pullBtn">Télécharger</button></div><div class="note">Catalogue : <a href="https://ollama.com/search" target="_blank" rel="noopener">ollama.com/search</a> · le serveur télécharge lui-même. Pour la recherche web, choisis un modèle marqué « tools » ; pour les images, un modèle « vision ».</div><div id="pullState"></div>'
- +'<h3>Installés</h3>'+(tags.length?tags.map(m=>{const d=m.details||{};return '<div class="card"><div class="row"><div><b>'+esc(m.name)+'</b><br><small>'+gb(m.size)+(d.parameter_size?' · '+esc(d.parameter_size):'')+(d.quantization_level?' · '+esc(d.quantization_level):'')+'</small></div><button class="danger" data-delmodel="'+esc(m.name)+'">Supprimer</button></div></div>'}).join(''):'<div class="note">Aucun modèle installé.</div>');
+ +'<h3>Installés</h3>'+(tags.length?tags.map(m=>{const d=m.details||{};const fix=/^hf\.co\//i.test(m.name)&&/gemma[-_ ]?4/i.test(m.name);return '<div class="card"><div class="row"><div><b>'+esc(m.name)+'</b><br><small>'+gb(m.size)+(d.parameter_size?' · '+esc(d.parameter_size):'')+(d.quantization_level?' · '+esc(d.quantization_level):'')+'</small>'+(fix?'<br><small>Gemma 4 importé depuis Hugging Face : clique sur 🔧 Réparer pour qu\'il réponde correctement.</small>':'')+'</div>'+(fix?'<button data-fixmodel="'+esc(m.name)+'">🔧 Réparer</button>':'')+'<button class="danger" data-delmodel="'+esc(m.name)+'">Supprimer</button></div></div>'}).join(''):'<div class="note">Aucun modèle installé.</div>');
 }
 async function pull(name){
  const st=$('#pullState');st.innerHTML='<div class="note" id="pullTxt">Connexion…</div><div class="bar"><div id="pullBar"></div></div>';
@@ -2610,6 +2769,13 @@ $('#box').onclick=async e=>{
  if(t.id==='goPersonas')return panelPersonas();
  if(t.id==='pullBtn'){const n=$('#pullName').value.trim();if(n)pull(n);return}
  if(t.dataset.unload){await api('/api/ollama/generate',{method:'POST',body:{model:t.dataset.unload,keep_alive:0}}).catch(x=>toast(x.message));return panelModels()}
+ if(t.dataset.fixmodel){
+  t.disabled=true;t.textContent='Réparation…';toast('Création de la version réparée (quelques secondes)…',60000);
+  try{const r=await postJson('/api/fixmodel',{model:t.dataset.fixmodel});
+   if(r.error)throw new Error(r.error);
+   await loadModels();await setModel(r.model);toast('✅ Modèle réparé : '+r.model+' (sélectionné). Tu peux supprimer l\'ancien.',7000);
+  }catch(x){toast(x.message,9000)}
+  return panelModels()}
  if(t.dataset.delmodel){if(!confirm('Supprimer '+t.dataset.delmodel+' du disque ?'))return;await api('/api/ollama/delete',{method:'DELETE',body:{model:t.dataset.delmodel,name:t.dataset.delmodel}}).catch(x=>toast(x.message));await loadModels();return panelModels()}
  if(t.dataset.tab){memTab=t.dataset.tab;return panelMemory()}
  if(t.id==='memoNow')return memorize(false);
