@@ -767,6 +767,43 @@ TXT = {
     },
 }
 
+TXT["fr"].update({
+    "common_intro": ("Ceci est une scène écrite à plusieurs voix. Chaque demande attribue une seule tâche "
+                     "précise, indiquée tout à la fin : diriger la scène, la narrer, ou jouer un personnage."),
+    "scene_h": "## Scène décrite par l'auteur", "cast_h": "## Personnages",
+    "task_h": "## Ta tâche maintenant",
+    "dir_task": ("Tu es le metteur en scène. Tu ne rédiges aucune réplique : tu décides seulement qui intervient "
+                 "ensuite et ce que son intervention doit apporter.\nRègles :\n%s\n\n"
+                 'Réponds uniquement en JSON : {"next": "<nom exact, %s ou FIN>", "intention": "<une phrase>"}'),
+    "narr_task": ("Tu es le narrateur. Écris uniquement le prochain passage de narration : décor, ambiance, actions, "
+                  "déplacements, expressions et transitions. Ne fais pas parler les personnages et ne décide pas à "
+                  "leur place de ce qu'ils vont dire. %s Respecte les consignes d'écriture de la scène."),
+    "role_task": ("Tu incarnes uniquement %s (voir sa fiche ci-dessus), aux côtés de : %s%s. Écris uniquement la "
+                  "prochaine intervention de %s : ses paroles et, entre astérisques, ses gestes et attitudes. %s "
+                  "N'écris jamais les répliques ni les actions des autres personnages, ne fais pas de narration "
+                  "générale, ne commente pas la scène et ne commence pas par ton nom. Reste fidèle à la fiche de %s "
+                  "et aux consignes d'écriture de la scène."),
+    "list_ref": "Choisis le prochain intervenant parmi les personnages ci-dessus (nom exact)",
+})
+TXT["en"].update({
+    "common_intro": ("This is a scene written by several voices. Each request gives one single, specific task, "
+                     "stated at the very end: directing the scene, narrating it, or playing a character."),
+    "scene_h": "## Scene as described by the author", "cast_h": "## Characters",
+    "task_h": "## Your task now",
+    "dir_task": ("You are the director. You never write any lines yourself: you only decide who takes the next turn "
+                 "and what that turn should bring.\nRules:\n%s\n\n"
+                 'Answer only in JSON: {"next": "<exact name, %s or END>", "intention": "<one sentence>"}'),
+    "narr_task": ("You are the narrator. Write only the next passage of narration: setting, mood, actions, movements, "
+                  "expressions and transitions. Do not make the characters speak and do not decide for them what "
+                  "they are going to say. %s Follow the scene's writing guidelines."),
+    "role_task": ("You play only %s (see their sheet above), alongside: %s%s. Write only %s's next turn: what they say "
+                  "and, between asterisks, their gestures and attitude. %s Never write the lines or actions of the "
+                  "other characters, do not write general narration, do not comment on the scene and do not start "
+                  "with your name. Stay true to %s's sheet and to the scene's writing guidelines."),
+    "list_ref": "Pick the next participant from the characters above (exact name)",
+})
+
+
 EN_WORDS = set("the and is are was were of to in with you he she they his her him at on for but not this that will be "
                "it as by from have has your my we their there what when who where into out up".split())
 FR_WORDS = set("le la les et est sont de des du un une à au aux en avec il elle ils elles son sa ses pour mais pas ce "
@@ -860,8 +897,13 @@ def list_scenes():
     return out
 
 
-def scene_transcript(turns, lang="fr", for_director=False, limit=14000):
+def scene_transcript(turns, lang="fr", for_director=True, limit=14000):
+    """Texte de la scène déjà écrite. Il est identique pour tous les rôles (consignes de l'auteur
+    comprises) et ne grandit que par la fin, pour qu'Ollama réutilise sa lecture d'un appel à l'autre.
+    Quand il devient trop long, on retire le début par paliers de 8 interventions, pour que
+    ce début ne change pas à chaque nouvelle réplique."""
     L = TXT[lang]
+    sep = " : " if lang == "fr" else ": "
     lines = []
     for t in turns:
         c = (t.get("content") or "").strip()
@@ -869,17 +911,19 @@ def scene_transcript(turns, lang="fr", for_director=False, limit=14000):
             continue
         sp = t.get("speaker")
         if sp == "direction":
-            if for_director:
-                lines.append(L["direction_tag"] % c)
+            lines.append(L["direction_tag"] % c)
         elif sp == "narrator":
-            lines.append("%s : %s" % (L["narrator"], c) if lang == "fr" else "%s: %s" % (L["narrator"], c))
+            lines.append(L["narrator"] + sep + c)
         elif sp == "block":
             lines.append(c)
         else:
-            lines.append(("%s : %s" if lang == "fr" else "%s: %s") % (t.get("name") or "?", c))
-    text = "\n\n".join(lines)
-    if len(text) > limit:
-        text = L["omitted"] + "\n\n" + text[-limit:]
+            lines.append((t.get("name") or "?") + sep + c)
+    start = 0
+    while start < len(lines) and len("\n\n".join(lines[start:])) > limit:
+        start += 8
+    text = "\n\n".join(lines[start:])
+    if start:
+        text = L["omitted"] + "\n\n" + text
     return text
 
 
@@ -958,28 +1002,44 @@ def ollama_call(body):
         raise RuntimeError(err)
 
 
+def scene_common(sc, cast, lang):
+    """Début commun à tous les appels d'une scène (identique d'un appel à l'autre)."""
+    L = TXT[lang]
+    sep = " : " if lang == "fr" else ": "
+    fiches = []
+    for p in cast:
+        f = "### %s\n%s" % (p["name"], p.get("system", "").strip() or L["no_sheet"])
+        mem = mem_block(persona_folder(p))
+        if mem:
+            f += "\n\n" + (L["memories_of"] % p["name"]) + "\n" + mem
+        fiches.append(f)
+    if sc.get("narrator"):
+        fiches.append("### %s\n%s" % (L["narrator"], L["narr_role"][0].upper() + L["narr_role"][1:]))
+    return "%s\n\n%s\n%s\n\n%s\n%s" % (L["common_intro"], L["scene_h"], sc.get("prompt", "").strip() or L["none"],
+                                       L["cast_h"], "\n\n".join(fiches))
+
+
+def scene_messages(sc, cast, turns, lang, task):
+    L = TXT[lang]
+    tr = scene_transcript(turns, lang)
+    user = "%s\n\n%s\n\n---\n\n%s\n%s" % (L["so_far"], tr or L["not_started"], L["task_h"], task)
+    return [{"role": "system", "content": scene_common(sc, cast, lang)}, {"role": "user", "content": user}]
+
+
 def director_choice(sc, cast, turns, model, settings, lang="fr"):
     L = TXT[lang]
     sp = spoken(turns)
     remaining = sc["maxTurns"] - len(sp)
-    sep = " : " if lang == "fr" else ": "
-    roster = "\n".join("- %s%s%s" % (p["name"], sep, re.sub(r"\s+", " ", p.get("system", ""))[:350] or L["no_sheet"])
-                       for p in cast)
-    if sc.get("narrator"):
-        roster += "\n- %s%s%s" % (L["narrator"], sep, L["narr_role"])
     r = L["dir_rules"]
-    rules = [r[0], r[1], r[2] % remaining, r[3], r[4]]
+    first = L["list_ref"] + (" — %s" % L["narrator"] if sc.get("narrator") else "") + "."
+    rules = [first, r[1], r[2] % remaining, r[3], r[4]]
     if sc.get("narrator") and not sp:
         rules.append(L["dir_open"] % L["narrator"])
     if remaining == 1:
         rules.append(L["dir_last"])
-    system = L["dir_system"] % (sc.get("prompt", "").strip() or L["none"], roster,
-                                "\n".join("- " + x for x in rules),
-                                L["narrator"] if sc.get("narrator") else L["character"])
-    tr = scene_transcript(turns, lang, for_director=True)
-    user = "%s\n\n%s\n\n%s" % (L["so_far"], tr or L["not_started"], L["who_now"])
+    task = L["dir_task"] % ("\n".join("- " + x for x in rules), L["narrator"] if sc.get("narrator") else L["character"])
     body = {"model": model, "stream": False, "format": "json", "think": False,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "messages": scene_messages(sc, cast, turns, lang, task),
             "options": dict(gen_options(sc, settings, 120), temperature=0.3)}
     ka = keep_alive_value(settings.get("keep_alive"))
     if ka is not None:
@@ -1005,40 +1065,29 @@ def speaker_request(sc, cast, turns, speaker, intention, model, settings, direct
     remaining = sc["maxTurns"] - len(sp)
     num_predict, length_txt = length_rule(sc, lang)
     others = [p["name"] for p in cast if p["id"] != speaker]
-    scene_txt = sc.get("prompt", "").strip() or L["none"]
     if speaker == "narrator":
         name = L["narrator"]
-        system = L["narr_system"] % (scene_txt, ", ".join(p["name"] for p in cast) or "-", length_txt)
+        task = L["narr_task"] % length_txt.replace("Ton intervention", "Ce passage").replace("your turn", "this passage").replace("Your turn", "This passage").replace("Keep your turn", "Keep this passage")
         ask = L["narr_ask"]
         stop_names = [p["name"] for p in cast]
     else:
-        p = next(x for x in cast if x["id"] == speaker)
-        name = p["name"]
-        parts = []
-        if p.get("system", "").strip():
-            parts.append(L["sheet"] + "\n" + p["system"].strip())
-        mem = mem_block(persona_folder(p))
-        if mem:
-            parts.append(L["memory"] + "\n" + mem)
-        parts.append(L["current"] + "\n" + scene_txt)
-        parts.append(L["role"] % (name, ", ".join(others) or L["nobody"],
-                                  L["and_narrator"] if sc.get("narrator") else "", name, length_txt))
-        system = "\n\n".join(parts)
+        name = next(x for x in cast if x["id"] == speaker)["name"]
+        task = L["role_task"] % (name, ", ".join(others) or L["nobody"],
+                                 L["and_narrator"] if sc.get("narrator") else "", name, length_txt, name)
         ask = L["ask"] % name
         stop_names = others + ([L["narrator"]] if sc.get("narrator") else [])
     if direction:
-        system += "\n\n" + L["author_dir"] + "\n" + direction
+        task += "\n\n" + L["author_dir"] + "\n" + direction
     if intention:
-        system += "\n\n" + L["director_hint"] + "\n" + intention
+        task += "\n\n" + L["director_hint"] + "\n" + intention
     if remaining <= 1:
-        system += "\n\n" + L["last"]
-    tr = scene_transcript(turns, lang)
-    user = ("%s\n\n%s\n\n%s" % (L["so_far"], tr, ask)) if tr else ("%s\n\n%s" % (L["starts"], ask))
+        task += "\n\n" + L["last"]
+    task += "\n\n" + ask
     stop = []
     for n in stop_names:
         stop += ["\n%s :" % n, "\n%s:" % n, "\n**%s" % n]
     body = {"model": model, "stream": True, "think": bool(sc.get("think")),
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "messages": scene_messages(sc, cast, turns, lang, task),
             "options": gen_options(sc, settings, num_predict, stop)}
     ka = keep_alive_value(settings.get("keep_alive"))
     if ka is not None:
